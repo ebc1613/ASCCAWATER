@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Camp ASCCA Water Tower Settings</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main class="shell config-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Settings</p>
+          <h1>System Settings</h1>
+        </div>
+        <div class="top-actions">
+          <a class="nav-button" href="/">Dashboard</a>
+        </div>
+      </header>
+
+      <section class="panel config-panel">
+        <div class="section-head">
+          <div>
+            <p class="label">ntfy</p>
+            <h2>LAN Notification Server</h2>
+          </div>
+          <div class="config-status" id="configStatus">Loading</div>
+        </div>
+
+        <form class="config-form" id="ntfyForm">
+          <label class="toggle-row">
+            <input id="ntfyEnabled" name="enabled" type="checkbox">
+            <span>Enable notifications</span>
+          </label>
+
+          <label>
+            <span>Server URL</span>
+            <input id="ntfyServerUrl" name="serverUrl" type="url" inputmode="url" placeholder="http://192.168.1.50:8081">
+          </label>
+
+          <label>
+            <span>Topic</span>
+            <input id="ntfyTopic" name="topic" type="text" autocapitalize="none" autocomplete="off" placeholder="camp-ascca-water">
+          </label>
+
+          <label>
+            <span>Access Token</span>
+            <input id="ntfyToken" name="token" type="password" autocomplete="new-password" placeholder="Optional">
+          </label>
+
+          <label class="toggle-row">
+            <input id="ntfyClearToken" name="clearToken" type="checkbox">
+            <span>Clear saved token</span>
+          </label>
+
+          <div class="config-actions">
+            <button id="saveNtfyButton" type="submit">Save Notification Settings</button>
+            <button id="testNtfyButton" type="button">Send Test</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="section-head">
+          <div>
+            <p class="label">Pump</p>
+            <h2>Pump Output Hardware</h2>
+          </div>
+          <div class="config-status" id="pumpOutputStatus">Loading</div>
+        </div>
+
+        <p class="config-status" id="pumpOutputRecommendation">Detecting hardware</p>
+
+        <form class="config-form" id="pumpOutputForm">
+          <label>
+            <span>Output Type</span>
+            <select id="pumpOutputType" name="type">
+              <option value="gpio" id="pumpOutputTypeGpioOption">Raspberry Pi GPIO</option>
+              <option value="usb_relay" id="pumpOutputTypeUsbRelayOption">USB Relay (LCUS-style)</option>
+            </select>
+          </label>
+
+          <div id="gpioFields">
+            <label>
+              <span>GPIO Pin (BCM numbering)</span>
+              <input id="pumpGpioPin" name="gpioPin" type="number" min="0" max="40" step="1" placeholder="17">
+            </label>
+            <label class="toggle-row">
+              <input id="pumpGpioActiveHigh" name="gpioActiveHigh" type="checkbox">
+              <span>Active-high relay module</span>
+            </label>
+          </div>
+
+          <div id="usbRelayFields">
+            <label>
+              <span>USB Relay Serial Port</span>
+              <select id="pumpUsbRelayPortSelect"></select>
+            </label>
+            <label id="pumpUsbRelayPortCustomLabel">
+              <span>Custom Port Path</span>
+              <input id="pumpUsbRelayPort" name="usbRelayPort" type="text" autocapitalize="none" autocomplete="off" placeholder="/dev/ttyUSB1">
+            </label>
+            <label>
+              <span>Baud Rate</span>
+              <input id="pumpUsbRelayBaud" name="usbRelayBaud" type="number" min="1200" max="115200" step="1" placeholder="9600">
+            </label>
+            <button id="refreshSerialPortsButton" type="button">Refresh Port List</button>
+          </div>
+
+          <p class="last-update">Changing this requires an app restart to take effect.</p>
+
+          <div class="config-actions">
+            <button id="savePumpOutputButton" type="submit">Save Pump Output Settings</button>
+          </div>
+        </form>
+      </section>
+    </main>
+    <script src="/config.js" defer></script>
+  </body>
+</html>

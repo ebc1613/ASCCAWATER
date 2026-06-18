@@ -1,0 +1,890 @@
+:root {
+  color-scheme: dark;
+  --bg: #081016;
+  --panel: #101a22;
+  --panel-2: #13212b;
+  --line: #263642;
+  --text: #edf7fb;
+  --muted: #8da2af;
+  --blue: #4ac1ff;
+  --green: #54d67b;
+  --yellow: #f0c64a;
+  --red: #ff5d5d;
+  --orange: #ff9b4a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow-x: hidden;
+}
+
+.shell {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+  padding: 28px;
+}
+
+.topbar,
+.section-head,
+.meter-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.topbar {
+  margin-bottom: 22px;
+  flex-wrap: wrap;
+  row-gap: 12px;
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  row-gap: 10px;
+}
+
+.nav-button {
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #3d5362;
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0 18px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: clamp(2rem, 4vw, 4rem);
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+h2 {
+  font-size: 1.35rem;
+}
+
+.eyebrow,
+.label,
+.muted {
+  color: var(--muted);
+}
+
+.eyebrow,
+.label {
+  font-size: 0.82rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.status-pill {
+  min-height: 56px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 1.05rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.status-green .status-dot {
+  background: var(--green);
+  box-shadow: 0 0 20px rgba(84, 214, 123, 0.7);
+}
+
+.status-yellow .status-dot {
+  background: var(--yellow);
+  box-shadow: 0 0 20px rgba(240, 198, 74, 0.7);
+}
+
+.status-red .status-dot {
+  background: var(--red);
+  box-shadow: 0 0 20px rgba(255, 93, 93, 0.7);
+}
+
+.hero-grid,
+.content-grid {
+  display: grid;
+  gap: 18px;
+}
+
+.hero-grid {
+  grid-template-columns: 1fr;
+}
+
+.content-grid {
+  grid-template-columns: minmax(0, 1.3fr) minmax(420px, 0.9fr);
+  margin-top: 18px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 22px;
+  overflow: hidden;
+}
+
+.level-panel {
+  min-height: 440px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 34px;
+}
+
+.level-copy {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 20px;
+}
+
+.big-reading {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: clamp(6rem, 14vw, 14rem);
+  font-weight: 900;
+  line-height: 0.88;
+}
+
+.big-reading small {
+  color: var(--muted);
+  font-size: 0.25em;
+  font-weight: 800;
+}
+
+.last-update {
+  color: var(--muted);
+  font-size: 1.05rem;
+}
+
+.alarm {
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  padding: 0 14px;
+  border-radius: 8px;
+  background: #1b2a33;
+  color: var(--text);
+  font-weight: 900;
+}
+
+.alarm.normal,
+.alarm.full {
+  color: #07120c;
+  background: var(--green);
+}
+
+.alarm.warning {
+  color: #1a1200;
+  background: var(--yellow);
+}
+
+.alarm.critical {
+  color: #160505;
+  background: var(--red);
+}
+
+.tank-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.tank {
+  position: relative;
+  width: 210px;
+  height: 360px;
+  border: 4px solid #607583;
+  border-radius: 8px 8px 18px 18px;
+  background: #071016;
+  overflow: hidden;
+}
+
+.tank::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: linear-gradient(90deg, rgba(255,255,255,0.18), transparent 35%, rgba(255,255,255,0.08));
+  pointer-events: none;
+}
+
+.tank-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 0;
+  background: linear-gradient(180deg, #7bddff 0%, #238bd6 100%);
+  transition: height 0.7s ease;
+}
+
+.tank-mark {
+  position: absolute;
+  z-index: 3;
+  left: 8px;
+  right: 8px;
+  border-top: 1px solid rgba(255,255,255,0.52);
+  color: rgba(255,255,255,0.82);
+  font-size: 0.75rem;
+  font-weight: 800;
+  padding-top: 2px;
+}
+
+.tank-mark.top {
+  top: 8px;
+}
+
+.tank-mark.low {
+  bottom: 25%;
+}
+
+.tank-mark.critical {
+  bottom: 12.5%;
+}
+
+.trend-panel canvas {
+  width: 100%;
+  height: 320px;
+  margin-top: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #121b22;
+}
+
+.trend-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.trend-range {
+  min-height: 42px;
+  padding: 0 14px;
+}
+
+.trend-range.active {
+  border-color: rgba(74, 193, 255, 0.8);
+  background: #123042;
+  color: #dff5ff;
+}
+
+.trend-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.pump-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(0, auto) minmax(420px, 1.6fr);
+  align-items: center;
+  gap: 18px;
+  row-gap: 14px;
+  margin-top: 18px;
+}
+
+.pump-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 16px;
+  row-gap: 10px;
+}
+
+.pump-state {
+  min-width: 92px;
+  min-height: 54px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  font-size: 1.2rem;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.pump-state.on {
+  background: var(--green);
+  color: #07120c;
+}
+
+.pump-state.off {
+  background: #1b2a33;
+  color: var(--muted);
+}
+
+.pump-state.fault {
+  background: var(--red);
+  color: #160505;
+}
+
+.pump-state.caution {
+  background: var(--red);
+  color: #160505;
+  box-shadow: 0 0 22px rgba(255, 93, 93, 0.35);
+}
+
+.pump-caution-text {
+  color: #ffb5b5;
+}
+
+.pump-controls,
+.pump-settings {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  row-gap: 10px;
+}
+
+.pump-settings {
+  justify-content: flex-end;
+}
+
+.pump-settings label {
+  display: grid;
+  gap: 6px;
+  min-width: 104px;
+}
+
+.pump-settings label span {
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pump-settings input {
+  width: 100%;
+  min-height: 48px;
+  border: 1px solid #3d5362;
+  border-radius: 8px;
+  background: #0d171e;
+  color: var(--text);
+  padding: 0 12px;
+  font: inherit;
+  font-weight: 900;
+}
+
+button {
+  min-height: 48px;
+  border: 1px solid #3d5362;
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0 18px;
+  font: inherit;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.pump-controls button.active {
+  color: #07120c;
+}
+
+#pumpAutoButton.active {
+  border-color: rgba(74, 193, 255, 0.95);
+  background: var(--blue);
+}
+
+#pumpManualOnButton.active {
+  border-color: rgba(255, 93, 93, 0.95);
+  background: #25313a;
+  color: var(--text);
+  box-shadow: inset 0 0 0 2px rgba(255, 93, 93, 0.35);
+}
+
+#pumpManualOffButton.active {
+  border-color: rgba(240, 198, 74, 0.95);
+  background: var(--yellow);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+.table-wrap {
+  margin-top: 16px;
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 560px;
+}
+
+th,
+td {
+  padding: 13px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+}
+
+th {
+  position: sticky;
+  top: 0;
+  background: #17242e;
+  color: var(--muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+td {
+  color: #d9e7ee;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostics-panel {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(120px, 1fr));
+  gap: 10px;
+  margin-top: 18px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(16, 26, 34, 0.72);
+}
+
+.diagnostic-item {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #0d171e;
+  font-variant-numeric: tabular-nums;
+}
+
+.diagnostic-item span:first-child {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.diagnostic-item strong {
+  font-size: 1.05rem;
+}
+
+.config-shell {
+  max-width: 960px;
+}
+
+.config-panel {
+  display: grid;
+  gap: 22px;
+}
+
+.config-form {
+  display: grid;
+  gap: 16px;
+}
+
+.config-form label {
+  display: grid;
+  gap: 8px;
+}
+
+.config-form label span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.config-form input[type="url"],
+.config-form input[type="text"],
+.config-form input[type="password"],
+.config-form input[type="number"],
+.config-form select {
+  min-height: 52px;
+  width: 100%;
+  border: 1px solid #3d5362;
+  border-radius: 8px;
+  background: #0d171e;
+  color: var(--text);
+  padding: 0 14px;
+  font: inherit;
+  font-weight: 800;
+}
+
+#gpioFields,
+#usbRelayFields {
+  display: grid;
+  gap: 16px;
+}
+
+#pumpUsbRelayPortCustomLabel {
+  display: none;
+}
+
+.toggle-row {
+  display: flex !important;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 12px;
+}
+
+.toggle-row input {
+  width: 24px;
+  height: 24px;
+  accent-color: var(--blue);
+}
+
+.config-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.config-actions button {
+  flex: 1;
+}
+
+.config-status {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d171e;
+  color: var(--muted);
+  padding: 0 12px;
+  font-weight: 900;
+}
+
+.config-status.ok {
+  background: rgba(84, 214, 123, 0.14);
+  color: var(--green);
+}
+
+.config-status.error {
+  background: rgba(255, 93, 93, 0.14);
+  color: #ffb5b5;
+}
+
+@media (max-width: 1180px) {
+  .content-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .pump-panel {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .pump-controls,
+  .pump-settings {
+    justify-content: stretch;
+  }
+
+  .pump-controls button,
+  .pump-settings button {
+    flex: 1;
+  }
+
+  .level-panel,
+  .trend-panel,
+  .table-panel {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 720px) {
+  .shell {
+    padding: 12px;
+  }
+
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .top-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  h1 {
+    font-size: 2rem;
+    line-height: 1.05;
+  }
+
+  h2 {
+    font-size: 1.15rem;
+  }
+
+  .eyebrow,
+  .label {
+    font-size: 0.72rem;
+  }
+
+  .section-head,
+  .trend-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .meter-line {
+    align-items: center;
+    flex-direction: row;
+    gap: 10px;
+  }
+
+  .panel {
+    padding: 14px;
+  }
+
+  .status-pill {
+    width: 100%;
+    min-height: 46px;
+    justify-content: center;
+    font-size: 0.95rem;
+  }
+
+  .nav-button {
+    width: 100%;
+    min-height: 46px;
+  }
+
+  .status-dot {
+    width: 12px;
+    height: 12px;
+  }
+
+  .trend-actions {
+    width: 100%;
+  }
+
+  .trend-range {
+    flex: 1;
+  }
+
+  .hero-grid,
+  .content-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .level-panel {
+    grid-template-columns: minmax(0, 1fr) 112px;
+    gap: 12px;
+    min-height: auto;
+  }
+
+  .level-copy {
+    gap: 12px;
+  }
+
+  .big-reading {
+    gap: 8px;
+    font-size: clamp(4.5rem, 24vw, 6.4rem);
+  }
+
+  .last-update {
+    font-size: 0.9rem;
+    line-height: 1.35;
+  }
+
+  .alarm {
+    min-height: 34px;
+    padding: 0 10px;
+    font-size: 0.86rem;
+  }
+
+  .tank-wrap {
+    align-items: stretch;
+  }
+
+  .tank {
+    width: 100%;
+    max-width: 112px;
+    height: 220px;
+  }
+
+  .tank-mark {
+    font-size: 0.65rem;
+  }
+
+  .pump-panel {
+    gap: 14px;
+    margin-top: 12px;
+  }
+
+  .pump-summary {
+    align-items: flex-start;
+  }
+
+  .pump-state {
+    min-width: 70px;
+    min-height: 42px;
+    font-size: 0.95rem;
+  }
+
+  .pump-controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+  }
+
+  .pump-controls button {
+    min-width: 0;
+    padding: 0 8px;
+    font-size: 0.88rem;
+  }
+
+  .pump-settings {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .pump-settings label,
+  .pump-settings button {
+    min-width: 0;
+  }
+
+  .pump-settings input {
+    min-height: 44px;
+  }
+
+  .pump-settings button {
+    grid-column: 1 / -1;
+  }
+
+  .content-grid {
+    gap: 12px;
+    margin-top: 12px;
+  }
+
+  .trend-panel canvas {
+    height: 240px;
+    margin-top: 12px;
+  }
+
+  .trend-range,
+  button {
+    min-height: 44px;
+  }
+
+  .table-wrap {
+    max-height: 260px;
+  }
+
+  .diagnostics-panel {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 8px;
+  }
+
+  .diagnostic-item {
+    min-height: 48px;
+    padding: 8px 10px;
+  }
+
+  .diagnostic-item span:first-child {
+    font-size: 0.68rem;
+  }
+
+  .diagnostic-item strong {
+    font-size: 0.95rem;
+  }
+
+  .config-actions {
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 420px) {
+  .shell {
+    padding: 10px;
+  }
+
+  .level-panel {
+    grid-template-columns: minmax(0, 1fr) 96px;
+  }
+
+  .big-reading {
+    font-size: clamp(4rem, 23vw, 5.8rem);
+  }
+
+  .tank {
+    max-width: 96px;
+    height: 198px;
+  }
+
+  .diagnostics-panel {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 300px) {
+  .level-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .tank {
+    width: min(150px, 48vw);
+    max-width: none;
+    height: 220px;
+  }
+
+  .pump-controls,
+  .pump-settings,
+  .diagnostics-panel {
+    grid-template-columns: 1fr;
+  }
+}

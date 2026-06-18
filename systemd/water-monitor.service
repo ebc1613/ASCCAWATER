@@ -1,0 +1,31 @@
+[Unit]
+Description=Campsite Water Tower Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=watermonitor
+Group=watermonitor
+WorkingDirectory=/opt/water-monitor
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--max-old-space-size=96
+Environment=HOST=0.0.0.0
+Environment=PORT=80
+Environment=SERIAL_PORT=/dev/ttyUSB0
+Environment=PUMP_CONTROL_ENABLED=false
+Environment=PUMP_GPIO_PIN=17
+Environment=NTFY_ENABLED=false
+EnvironmentFile=-/etc/default/water-monitor
+ExecStart=/usr/bin/node /opt/water-monitor/server.js
+Restart=on-failure
+RestartSec=10
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+MemoryMax=192M
+MemoryHigh=128M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

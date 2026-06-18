@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Camp ASCCA Water Tower</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Well House Monitor</p>
+          <h1>Camp ASCCA Water Tower</h1>
+        </div>
+        <div class="top-actions">
+          <a class="nav-button" href="/config.html">Settings</a>
+          <div class="status-pill status-waiting" id="commStatus">
+            <span class="status-dot"></span>
+            <span>Waiting for Data</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="hero-grid">
+        <article class="panel level-panel">
+          <div class="level-copy">
+            <p class="label">Current Water Level</p>
+            <div class="big-reading"><span id="feetValue">--</span><small>ft</small></div>
+            <div class="meter-line">
+              <span id="percentValue">--% full</span>
+              <span id="alarmStatus" class="alarm waiting">Waiting</span>
+            </div>
+            <p class="last-update">Last update: <span id="lastUpdate">Waiting for Data</span></p>
+          </div>
+          <div class="tank-wrap" aria-label="Tank fill graphic">
+            <div class="tank">
+              <div class="tank-fill" id="tankFill"></div>
+              <div class="tank-mark top">8 ft</div>
+              <div class="tank-mark low">2 ft</div>
+              <div class="tank-mark critical">1 ft</div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel pump-panel" aria-label="Pump controls">
+        <div class="pump-summary">
+          <div>
+            <p class="label">Pump Control</p>
+            <h2 id="pumpStateText">Pump Off</h2>
+            <p class="last-update" id="pumpReason">Manual off.</p>
+          </div>
+          <div class="pump-state off" id="pumpStateBadge">Off</div>
+        </div>
+
+        <div class="pump-controls">
+          <button id="pumpAutoButton" type="button">Auto</button>
+          <button id="pumpManualOnButton" type="button">Manual On</button>
+          <button id="pumpManualOffButton" type="button">Manual Off</button>
+        </div>
+
+        <form class="pump-settings" id="pumpSettingsForm">
+          <label>
+            <span>On Below</span>
+            <input id="pumpOnFeet" name="autoOnFeet" type="number" min="0.1" max="7.5" step="0.1" value="2.0">
+          </label>
+          <label>
+            <span>Off At</span>
+            <input id="pumpOffFeet" name="autoOffFeet" type="number" min="0.6" max="8.0" step="0.1" value="7.2">
+          </label>
+          <label>
+            <span>No Signal Stop</span>
+            <input id="pumpStaleMinutes" name="staleShutdownMinutes" type="number" min="5" max="240" step="5" value="60">
+          </label>
+          <label>
+            <span>Max Run Hours</span>
+            <input id="pumpMaxHours" name="maxRuntimeHours" type="number" min="1" max="24" step="1" value="12">
+          </label>
+          <button type="submit">Save Levels</button>
+        </form>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel trend-panel">
+          <div class="section-head">
+            <div>
+              <p class="label">Trend</p>
+              <h2>Water Level</h2>
+            </div>
+            <div class="trend-actions" aria-label="Trend range">
+              <button class="trend-range active" id="trend48Button" type="button" data-hours="48">48 Hours</button>
+              <button class="trend-range" id="trend7DayButton" type="button" data-hours="168">7 Days</button>
+            </div>
+          </div>
+          <div class="trend-meta">
+            <span id="trendRangeLabel">48-hour view</span>
+            <span>8.0 ft max</span>
+          </div>
+          <canvas id="trendCanvas" width="900" height="320"></canvas>
+        </article>
+
+        <article class="panel table-panel">
+          <div class="section-head">
+            <div>
+              <p class="label">Recent Readings</p>
+              <h2>History</h2>
+            </div>
+            <button id="refreshButton" type="button">Refresh</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Feet</th>
+                  <th>PSI</th>
+                  <th>Battery</th>
+                  <th>RSSI</th>
+                  <th>SNR</th>
+                </tr>
+              </thead>
+              <tbody id="readingsBody">
+                <tr><td colspan="6">Waiting for Data</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="diagnostics-panel" aria-label="Technical diagnostics">
+        <div class="diagnostic-item">
+          <span>PSI</span>
+          <strong><span id="psiValue">--</span></strong>
+        </div>
+        <div class="diagnostic-item">
+          <span>Battery</span>
+          <strong><span id="batteryValue">--</span> V</strong>
+        </div>
+        <div class="diagnostic-item">
+          <span>RSSI</span>
+          <strong id="rssiValue">--</strong>
+        </div>
+        <div class="diagnostic-item">
+          <span>SNR</span>
+          <strong id="snrValue">--</strong>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

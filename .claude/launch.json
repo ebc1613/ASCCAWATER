@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "water-monitor-dev",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "SIMULATE=true PORT=8099 /opt/homebrew/opt/node@20/bin/node server.js"],
+      "port": 8099
+    }
+  ]
+}
