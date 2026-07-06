@@ -4,6 +4,7 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/opt/water-monitor}"
 APP_USER="${APP_USER:-watermonitor}"
 SERVICE_FILE="/etc/systemd/system/water-monitor.service"
+WATCHDOG_SERVICE_FILE="/etc/systemd/system/water-monitor-watchdog.service"
 DEFAULTS_FILE="/etc/default/water-monitor"
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -29,6 +30,7 @@ if [[ ! -f "${DEFAULTS_FILE}" ]]; then
 fi
 
 install -m 0644 "${APP_DIR}/systemd/water-monitor.service" "${SERVICE_FILE}"
+install -m 0644 "${APP_DIR}/systemd/water-monitor-watchdog.service" "${WATCHDOG_SERVICE_FILE}"
 
 cd "${APP_DIR}"
 npm install --omit=dev
@@ -36,5 +38,8 @@ npm install --omit=dev
 usermod -aG dialout "${APP_USER}" || true
 systemctl daemon-reload
 systemctl enable --now water-monitor
+systemctl enable --now water-monitor-watchdog
 
-echo "Installed water-monitor. Check logs with: journalctl -u water-monitor -f"
+echo "Installed water-monitor and its pump watchdog."
+echo "Check logs with: journalctl -u water-monitor -f"
+echo "Check watchdog logs with: journalctl -u water-monitor-watchdog -f"

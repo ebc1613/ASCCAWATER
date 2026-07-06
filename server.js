@@ -79,7 +79,9 @@ const CONFIG = {
     gpioPin: Number.parseInt(process.env.PUMP_GPIO_PIN || "17", 10),
     activeHigh: String(process.env.PUMP_GPIO_ACTIVE_HIGH || "true").toLowerCase() !== "false",
     usbRelayPort: process.env.PUMP_USB_RELAY_PORT || "",
-    usbRelayBaud: Number.parseInt(process.env.PUMP_USB_RELAY_BAUD || "9600", 10)
+    usbRelayBaud: Number.parseInt(process.env.PUMP_USB_RELAY_BAUD || "9600", 10),
+    usbRelayVendorId: process.env.PUMP_USB_RELAY_VENDOR_ID || "",
+    usbRelayProductId: process.env.PUMP_USB_RELAY_PRODUCT_ID || ""
   },
   ntfy: {
     enabled: String(process.env.NTFY_ENABLED || "").toLowerCase() === "true",
@@ -88,11 +90,6 @@ const CONFIG = {
     token: process.env.NTFY_TOKEN || ""
   },
   maxFeet: 8.0,
-  alarm: {
-    criticalFeet: 1.0,
-    lowWarningFeet: 2.0,
-    fullFeet: 7.5
-  },
   status: {
     greenMs: 5 * 60 * 1000,
     yellowMs: 10 * 60 * 1000
@@ -132,6 +129,13 @@ const statements = {
     DELETE FROM readings
     WHERE timestamp < ?
   `),
+  readingAtOrBefore: db.prepare(`
+    SELECT feet, timestamp
+    FROM readings
+    WHERE timestamp <= ?
+    ORDER BY timestamp DESC, id DESC
+    LIMIT 1
+  `),
   getSetting: db.prepare(`
     SELECT value
     FROM app_settings
@@ -170,8 +174,13 @@ const DEFAULT_PUMP_SETTINGS = {
   mode: "manual_off",
   autoOnFeet: 2.0,
   autoOffFeet: 7.2,
-  staleShutdownMinutes: 60,
-  maxRuntimeMinutes: 12 * 60
+  // Backstops sized for overflow safety, not convenience. Because the sensor
+  // only reports every few minutes, a stuck-low sensor or a relay that will
+  // not release can keep filling between readings - these two ceilings bound
+  // how long that can go on. Tune both from the Pump panel in /config.html to
+  // match how long your pump actually takes to fill the tank.
+  staleShutdownMinutes: 15,
+  maxRuntimeMinutes: 120
 };
 
 const DEFAULT_PUMP_OUTPUT_SETTINGS = {
@@ -179,7 +188,9 @@ const DEFAULT_PUMP_OUTPUT_SETTINGS = {
   gpioPin: CONFIG.pump.gpioPin,
   gpioActiveHigh: CONFIG.pump.activeHigh,
   usbRelayPort: CONFIG.pump.usbRelayPort,
-  usbRelayBaud: CONFIG.pump.usbRelayBaud
+  usbRelayBaud: CONFIG.pump.usbRelayBaud,
+  usbRelayVendorId: CONFIG.pump.usbRelayVendorId,
+  usbRelayProductId: CONFIG.pump.usbRelayProductId
 };
 
 // LCUS-1/LCUS-2 style USB relay protocol: 4-byte command, last byte is a
@@ -194,6 +205,29 @@ const DEFAULT_NTFY_SETTINGS = {
   token: CONFIG.ntfy.token
 };
 
+const DEFAULT_ALERT_SETTINGS = {
+  criticalFeet: 1.0,
+  lowWarningFeet: 2.0,
+  fullFeet: 7.5,
+  lowWaterAlertsEnabled: true,
+  rapidLossAlertsEnabled: true,
+  rapidLossFeet: 1.0,
+  rapidLossMinutes: 30
+};
+
+const alertState = {
+  lastAlarmLevel: null,
+  rapidLossArmed: true
+};
+
+// Tracks which pump/relay safety conditions we've already notified about, so a
+// single fault sends one message when it starts and one "all clear" when it
+// ends - not a fresh alert on every 60-second control tick.
+const pumpAlertState = {
+  faultNotified: false,
+  staleNotified: false
+};
+
 let pumpOutput = null;
 let pumpState = {
   enabled: CONFIG.pump.enabled,
@@ -205,7 +239,9 @@ let pumpState = {
   fault: null,
   output: {
     type: CONFIG.pump.output,
-    available: false
+    available: false,
+    dropCount: 0,
+    lastDropAt: null
   }
 };
 
@@ -216,6 +252,18 @@ function clamp(value, min, max) {
 function round(value, places = 2) {
   const scale = 10 ** places;
   return Math.round(value * scale) / scale;
+}
+
+// Human-friendly duration for notification text, e.g. 120 -> "2 hours",
+// 90 -> "1.5 hours", 15 -> "15 minutes". Avoids "0 hours" for sub-hour values.
+function formatDuration(minutes) {
+  if (minutes >= 60) {
+    const hours = minutes / 60;
+    const label = Number.isInteger(hours) ? String(hours) : hours.toFixed(1);
+    return `${label} hour${hours === 1 ? "" : "s"}`;
+  }
+  const mins = Math.round(minutes);
+  return `${mins} minute${mins === 1 ? "" : "s"}`;
 }
 
 function normalizeReading(input) {
@@ -267,17 +315,17 @@ function getCommunicationStatus(timestamp) {
   return { level: "red", label: "No Recent Updates", ageSeconds };
 }
 
-function getAlarmState(feet) {
+function getAlarmState(feet, alertSettings = getAlertSettings()) {
   if (!Number.isFinite(feet)) {
     return { level: "waiting", label: "Waiting for Data" };
   }
-  if (feet < CONFIG.alarm.criticalFeet) {
+  if (feet < alertSettings.criticalFeet) {
     return { level: "critical", label: "Critical Low" };
   }
-  if (feet < CONFIG.alarm.lowWarningFeet) {
+  if (feet < alertSettings.lowWarningFeet) {
     return { level: "warning", label: "Low Warning" };
   }
-  if (feet > CONFIG.alarm.fullFeet) {
+  if (feet > alertSettings.fullFeet) {
     return { level: "full", label: "Near Full" };
   }
   return { level: "normal", label: "Normal" };
@@ -347,6 +395,11 @@ function getPumpOutputSettings() {
   return sanitizePumpOutputSettings(stored);
 }
 
+function sanitizeUsbHexId(value) {
+  const trimmed = String(value || "").trim().toLowerCase();
+  return /^[0-9a-f]{1,4}$/.test(trimmed) ? trimmed : "";
+}
+
 function sanitizePumpOutputSettings(input) {
   const type = input.type === "usb_relay" ? "usb_relay" : "gpio";
   const gpioPin = Math.round(clamp(Number(input.gpioPin), 0, 40));
@@ -357,7 +410,9 @@ function sanitizePumpOutputSettings(input) {
     gpioPin: Number.isFinite(gpioPin) ? gpioPin : DEFAULT_PUMP_OUTPUT_SETTINGS.gpioPin,
     gpioActiveHigh: Boolean(input.gpioActiveHigh),
     usbRelayPort: String(input.usbRelayPort || "").trim(),
-    usbRelayBaud: Number.isFinite(usbRelayBaud) ? usbRelayBaud : DEFAULT_PUMP_OUTPUT_SETTINGS.usbRelayBaud
+    usbRelayBaud: Number.isFinite(usbRelayBaud) ? usbRelayBaud : DEFAULT_PUMP_OUTPUT_SETTINGS.usbRelayBaud,
+    usbRelayVendorId: sanitizeUsbHexId(input.usbRelayVendorId),
+    usbRelayProductId: sanitizeUsbHexId(input.usbRelayProductId)
   };
 }
 
@@ -408,7 +463,83 @@ function sanitizeNtfySettings(input, options = {}) {
   return { enabled, serverUrl, topic, token };
 }
 
-function sendNtfyNotification(settings, message, title = "Camp ASCCA Water Tower") {
+function getAlertSettings() {
+  const stored = getStoredJsonSetting("alerts", DEFAULT_ALERT_SETTINGS);
+  return sanitizeAlertSettings(stored);
+}
+
+function sanitizeAlertSettings(input) {
+  let criticalFeet = round(clamp(Number(input.criticalFeet), 0.1, CONFIG.maxFeet - 0.4), 2);
+  if (!Number.isFinite(criticalFeet)) criticalFeet = DEFAULT_ALERT_SETTINGS.criticalFeet;
+
+  let lowWarningFeet = round(clamp(Number(input.lowWarningFeet), criticalFeet + 0.2, CONFIG.maxFeet - 0.2), 2);
+  if (!Number.isFinite(lowWarningFeet)) lowWarningFeet = Math.max(DEFAULT_ALERT_SETTINGS.lowWarningFeet, criticalFeet + 0.2);
+
+  let fullFeet = round(clamp(Number(input.fullFeet), lowWarningFeet + 0.2, CONFIG.maxFeet), 2);
+  if (!Number.isFinite(fullFeet)) fullFeet = Math.max(DEFAULT_ALERT_SETTINGS.fullFeet, lowWarningFeet + 0.2);
+
+  let rapidLossFeet = round(clamp(Number(input.rapidLossFeet), 0.1, CONFIG.maxFeet), 2);
+  if (!Number.isFinite(rapidLossFeet)) rapidLossFeet = DEFAULT_ALERT_SETTINGS.rapidLossFeet;
+
+  let rapidLossMinutes = Math.round(clamp(Number(input.rapidLossMinutes), 5, 720));
+  if (!Number.isFinite(rapidLossMinutes)) rapidLossMinutes = DEFAULT_ALERT_SETTINGS.rapidLossMinutes;
+
+  return {
+    criticalFeet,
+    lowWarningFeet,
+    fullFeet,
+    lowWaterAlertsEnabled: Boolean(input.lowWaterAlertsEnabled),
+    rapidLossAlertsEnabled: Boolean(input.rapidLossAlertsEnabled),
+    rapidLossFeet,
+    rapidLossMinutes
+  };
+}
+
+function checkWaterAlerts(saved) {
+  const alertSettings = getAlertSettings();
+  const ntfySettings = getNtfySettings();
+  const alarm = getAlarmState(saved.feet, alertSettings);
+
+  if (alertSettings.lowWaterAlertsEnabled && ntfySettings.enabled && alarm.level !== alertState.lastAlarmLevel) {
+    const messages = {
+      critical: `Critical low water: ${saved.feet.toFixed(2)} ft (tower ${saved.tower}).`,
+      warning: `Low water warning: ${saved.feet.toFixed(2)} ft (tower ${saved.tower}).`,
+      normal: (alertState.lastAlarmLevel === "warning" || alertState.lastAlarmLevel === "critical")
+        ? `Water level recovered to ${saved.feet.toFixed(2)} ft (tower ${saved.tower}).`
+        : null
+    };
+    const message = messages[alarm.level];
+    if (message) {
+      sendNtfyNotification(ntfySettings, message, "Camp ASCCA Water Tower - Level Alert")
+        .catch((error) => console.error(`Failed to send low-water notification: ${error.message}`));
+    }
+  }
+  alertState.lastAlarmLevel = alarm.level;
+
+  if (alertSettings.rapidLossAlertsEnabled) {
+    const windowMs = alertSettings.rapidLossMinutes * 60 * 1000;
+    const cutoff = new Date(new Date(saved.timestamp).getTime() - windowMs).toISOString();
+    const baseline = statements.readingAtOrBefore.get(cutoff);
+
+    if (baseline) {
+      const drop = baseline.feet - saved.feet;
+      if (drop >= alertSettings.rapidLossFeet) {
+        if (alertState.rapidLossArmed) {
+          alertState.rapidLossArmed = false;
+          if (ntfySettings.enabled) {
+            const message = `Rapid water loss: ${drop.toFixed(2)} ft in ${alertSettings.rapidLossMinutes} minutes (tower ${saved.tower}, now ${saved.feet.toFixed(2)} ft).`;
+            sendNtfyNotification(ntfySettings, message, "Camp ASCCA Water Tower - Rapid Loss")
+              .catch((error) => console.error(`Failed to send rapid-loss notification: ${error.message}`));
+          }
+        }
+      } else {
+        alertState.rapidLossArmed = true;
+      }
+    }
+  }
+}
+
+function sendNtfyNotification(settings, message, title = "Camp ASCCA Water Tower", options = {}) {
   return new Promise((resolve, reject) => {
     if (!settings.enabled) {
       reject(new Error("ntfy notifications are disabled."));
@@ -418,6 +549,10 @@ function sendNtfyNotification(settings, message, title = "Camp ASCCA Water Tower
     const target = new URL(`${settings.serverUrl}/${encodeURIComponent(settings.topic)}`);
     const body = Buffer.from(message);
     const client = target.protocol === "https:" ? https : http;
+    // The Title header must be plain ASCII - HTTP header values cannot carry
+    // emoji or other multi-byte characters (Node throws ERR_INVALID_CHAR).
+    // Visual urgency is conveyed via ntfy's Tags (emoji shortcodes) and
+    // Priority headers instead, which are ASCII.
     const req = client.request(target, {
       method: "POST",
       timeout: 5000,
@@ -425,6 +560,8 @@ function sendNtfyNotification(settings, message, title = "Camp ASCCA Water Tower
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Length": body.length,
         "Title": title,
+        ...(options.priority ? { "Priority": String(options.priority) } : {}),
+        ...(options.tags ? { "Tags": options.tags } : {}),
         ...(settings.token ? { "Authorization": `Bearer ${settings.token}` } : {})
       }
     }, (response) => {
@@ -442,6 +579,23 @@ function sendNtfyNotification(settings, message, title = "Camp ASCCA Water Tower
     req.on("error", reject);
     req.end(body);
   });
+}
+
+// Fire-and-forget notification for pump/relay safety events. Unlike the
+// water-level alerts, these are about the pump hardware and controller, so the
+// message body includes plain-English "what to do" steps for on-site staff who
+// are not expected to know the software internals.
+function sendPumpAlert(title, message, options = {}) {
+  let ntfySettings;
+  try {
+    ntfySettings = getNtfySettings();
+  } catch (error) {
+    console.error(`Could not load ntfy settings for pump alert: ${error.message}`);
+    return;
+  }
+  if (!ntfySettings.enabled) return;
+  sendNtfyNotification(ntfySettings, message, title, options)
+    .catch((error) => console.error(`Failed to send pump alert "${title}": ${error.message}`));
 }
 
 function sanitizePumpSettings(input) {
@@ -493,23 +647,79 @@ function initPumpOutput() {
   }
 }
 
+async function resolveUsbRelayPath(settings) {
+  if (!settings.usbRelayVendorId || !settings.usbRelayProductId) {
+    return settings.usbRelayPort || null;
+  }
+
+  // Cheap CH340-style relay boards rarely have a unique serial number
+  // programmed, so the OS cannot keep their /dev path stable across a
+  // disconnect/reconnect - each reconnect can get renumbered. Vendor and
+  // product ID survive that renumbering, so prefer matching on those over
+  // trusting a fixed path. usbRelayPort is kept only as a fallback for when
+  // no match is found (e.g. unplugged) or when VID/PID are not set.
+  try {
+    const ports = await SerialPort.list();
+    const match = ports.find((candidate) =>
+      (candidate.vendorId || "").toLowerCase() === settings.usbRelayVendorId.toLowerCase() &&
+      (candidate.productId || "").toLowerCase() === settings.usbRelayProductId.toLowerCase());
+    return match ? match.path : null;
+  } catch (error) {
+    console.warn(`USB relay discovery by vendor/product ID failed: ${error.message}`);
+    return settings.usbRelayPort || null;
+  }
+}
+
 function initUsbRelayOutput(settings) {
-  if (!settings.usbRelayPort) {
+  const byIdentity = Boolean(settings.usbRelayVendorId && settings.usbRelayProductId);
+  if (!settings.usbRelayPort && !byIdentity) {
     pumpState.fault = "USB relay port is not configured.";
     pumpState.reason = "No USB relay port set; pump held off.";
     return;
   }
 
-  const port = new SerialPort({
-    path: settings.usbRelayPort,
-    baudRate: settings.usbRelayBaud,
-    autoOpen: false
-  });
+  pumpOutput = { kind: "usb_relay", port: null };
 
-  pumpOutput = { kind: "usb_relay", port };
+  const reopen = async () => {
+    if (pumpOutput.port?.isOpen) return;
 
-  const reopen = () => {
-    if (port.isOpen) return;
+    const path = await resolveUsbRelayPath(settings);
+    if (!path) {
+      pumpState.output.available = false;
+      pumpState.fault = byIdentity
+        ? `No USB relay matching ${settings.usbRelayVendorId}:${settings.usbRelayProductId} found.`
+        : "USB relay port is not configured.";
+      console.warn(pumpState.fault);
+      setTimeout(reopen, 10000);
+      return;
+    }
+
+    const port = new SerialPort({ path, baudRate: settings.usbRelayBaud, autoOpen: false });
+    pumpOutput.port = port;
+
+    port.on("open", () => {
+      pumpState.output.available = true;
+      pumpState.fault = null;
+      pumpState.reason = `USB relay on ${path} initialized off.`;
+      console.log(`Pump USB relay connected at ${path} (${settings.usbRelayBaud} baud)`);
+      writePumpOutput(false);
+    });
+
+    port.on("error", (error) => {
+      pumpState.output.available = false;
+      pumpState.fault = `USB relay error: ${error.message}`;
+      console.error(pumpState.fault);
+    });
+
+    port.on("close", () => {
+      pumpState.output.available = false;
+      pumpState.fault = "USB relay port closed.";
+      pumpState.output.dropCount += 1;
+      pumpState.output.lastDropAt = new Date().toISOString();
+      console.warn(`Pump USB relay port closed (drop #${pumpState.output.dropCount}); retrying in 10 seconds.`);
+      setTimeout(reopen, 10000);
+    });
+
     port.open((error) => {
       if (error) {
         pumpState.output.available = false;
@@ -520,27 +730,6 @@ function initUsbRelayOutput(settings) {
     });
   };
 
-  port.on("open", () => {
-    pumpState.output.available = true;
-    pumpState.fault = null;
-    pumpState.reason = `USB relay on ${settings.usbRelayPort} initialized off.`;
-    console.log(`Pump USB relay connected at ${settings.usbRelayPort} (${settings.usbRelayBaud} baud)`);
-    writePumpOutput(false);
-  });
-
-  port.on("error", (error) => {
-    pumpState.output.available = false;
-    pumpState.fault = `USB relay error: ${error.message}`;
-    console.error(pumpState.fault);
-  });
-
-  port.on("close", () => {
-    pumpState.output.available = false;
-    pumpState.fault = "USB relay port closed.";
-    console.warn("Pump USB relay port closed; retrying in 10 seconds.");
-    setTimeout(reopen, 10000);
-  });
-
   reopen();
 }
 
@@ -548,21 +737,56 @@ function writePumpOutput(pumpOn) {
   if (!pumpOutput) return;
 
   if (pumpOutput.kind === "gpio") {
-    const active = pumpOutput.activeHigh ? 1 : 0;
-    const inactive = pumpOutput.activeHigh ? 0 : 1;
-    pumpOutput.gpio.writeSync(pumpOn ? active : inactive);
+    try {
+      const active = pumpOutput.activeHigh ? 1 : 0;
+      const inactive = pumpOutput.activeHigh ? 0 : 1;
+      pumpOutput.gpio.writeSync(pumpOn ? active : inactive);
+    } catch (error) {
+      // A write we can't confirm succeeded must not be trusted as the real
+      // state. Mark the output unavailable so evaluatePumpControl() forces
+      // pumpState.pumpOn back to false on its next tick instead of the
+      // dashboard silently showing a commanded state that never reached
+      // the hardware.
+      pumpState.output.available = false;
+      pumpState.fault = `GPIO write failed: ${error.message}`;
+      console.error(pumpState.fault);
+    }
     return;
   }
 
   if (pumpOutput.kind === "usb_relay") {
-    if (!pumpOutput.port.isOpen) return;
+    if (!pumpOutput.port || !pumpOutput.port.isOpen || pumpOutput.port.destroyed) {
+      pumpState.output.available = false;
+      pumpState.fault = pumpState.fault || "USB relay port is not open.";
+      return;
+    }
     pumpOutput.port.write(pumpOn ? USB_RELAY_ON : USB_RELAY_OFF, (error) => {
       if (error) {
+        // Do not also force-close the port here: the underlying device
+        // failure that caused this write to fail already triggers the
+        // port's own "error"/"close" events independently, which own
+        // reconnection via the existing reopen() retry loop. Closing it
+        // again here double-schedules that retry and races a fresh
+        // successful reopen, clobbering good state with a stale fault.
+        pumpState.output.available = false;
         pumpState.fault = `USB relay write failed: ${error.message}`;
         console.error(pumpState.fault);
       }
     });
   }
+}
+
+function reassertPumpOutput() {
+  // Defense against a relay that changes state on its own - a welded/stuck
+  // contact, EMI, a brownout on the relay board, or a board that powers up in
+  // its last (ON) state. Everywhere else we only *send* a relay command on a
+  // state transition (setPumpOn early-returns when nothing changed), so a
+  // spuriously energized relay would otherwise never receive another OFF and
+  // could fill the tank to overflow while the software still believes it is
+  // off. Re-driving the desired physical state on a fast timer means a relay
+  // that drifts out of sync is corrected within seconds, in either direction.
+  if (!pumpOutput || !pumpState.output.available) return;
+  writePumpOutput(pumpState.pumpOn);
 }
 
 function logPumpEvent(action, reason, latest) {
@@ -607,7 +831,30 @@ function evaluatePumpControl() {
   const staleMs = settings.staleShutdownMinutes * 60 * 1000;
   if (ageMs > staleMs) {
     setPumpOn(false, `Stopped because no LoRa reading arrived for ${settings.staleShutdownMinutes} minutes.`, latest);
+    if (!pumpAlertState.staleNotified) {
+      pumpAlertState.staleNotified = true;
+      sendPumpAlert(
+        "Water tower: no signal - pump stopped",
+        `The monitor stopped hearing from the tank sensor for ${settings.staleShutdownMinutes} minutes, so the pump was shut off as a precaution. It will not run when it cannot see the water level.\n\n` +
+        "This is almost always a dead battery or lost power at the tank sensor, not the pump itself.\n\n" +
+        "WHAT TO DO:\n" +
+        "1. Walk out to the tank and look at the small monitor/sensor box - is its power light on?\n" +
+        "2. Check the battery and solar panel that power it.\n" +
+        "3. If you cannot fix it, leave it be - the pump stays off for safety. Water can be added manually if needed; call maintenance.\n\n" +
+        "You will get an \"all clear\" message here when the signal comes back.",
+        { tags: "warning", priority: "high" }
+      );
+    }
     return;
+  }
+
+  if (pumpAlertState.staleNotified) {
+    pumpAlertState.staleNotified = false;
+    sendPumpAlert(
+      "Water tower: signal restored",
+      "The tank sensor is reporting again and automatic pump control is back to normal. No action needed.",
+      { tags: "white_check_mark" }
+    );
   }
 
   if (!CONFIG.pump.enabled) {
@@ -617,13 +864,48 @@ function evaluatePumpControl() {
 
   if (pumpState.fault || !pumpState.output.available) {
     setPumpOn(false, pumpState.fault || "Pump output unavailable; pump held off.", latest);
+    if (!pumpAlertState.faultNotified) {
+      pumpAlertState.faultNotified = true;
+      sendPumpAlert(
+        "Water pump: relay problem - pump held off",
+        `The monitor cannot reliably control the pump relay right now, so it is holding the pump OFF to be safe.\n\n` +
+        `Details: ${pumpState.fault || "relay not available"}\n\n` +
+        "This is usually the USB relay unplugged, a loose USB cable, or the relay box losing power.\n\n" +
+        "WHAT TO DO:\n" +
+        "1. Check the USB cable between the Raspberry Pi and the relay box - unplug it and plug it back in firmly.\n" +
+        "2. Make sure the relay box has power.\n" +
+        "3. Control resumes on its own once it reconnects, and you will get an \"all clear\" here.\n\n" +
+        "Until then the pump cannot run automatically. Call maintenance if it does not clear.",
+        { tags: "warning", priority: "high" }
+      );
+    }
     return;
+  }
+
+  if (pumpAlertState.faultNotified) {
+    pumpAlertState.faultNotified = false;
+    sendPumpAlert(
+      "Water pump: relay reconnected",
+      "The pump relay is working again and automatic control has resumed. No action needed.",
+      { tags: "white_check_mark" }
+    );
   }
 
   if (pumpState.pumpOn && pumpState.startedAt) {
     const runtimeMs = Date.now() - new Date(pumpState.startedAt).getTime();
     if (runtimeMs > settings.maxRuntimeMinutes * 60 * 1000) {
       setPumpOn(false, `Stopped after max runtime of ${Math.round(settings.maxRuntimeMinutes / 60)} hours.`, latest);
+      sendPumpAlert(
+        "Water pump: safety shutoff - ran too long",
+        `The pump ran continuously for about ${formatDuration(settings.maxRuntimeMinutes)} and was automatically shut off to prevent an overflow.\n\n` +
+        "This usually means the tank is not filling the way it should - a closed valve, the pump losing its prime, or the level sensor stuck on one number.\n\n" +
+        "WHAT TO DO:\n" +
+        "1. Go look at the tank and check the real water level.\n" +
+        "2. If it is full or overflowing, leave the pump OFF, check the float switch, and call maintenance.\n" +
+        "3. If the tank is low and needs water, open the dashboard, set the pump to Manual On, and watch it. If it shuts off again without filling, the pump or a valve needs attention.\n\n" +
+        "The pump will stay off until someone turns it back on from the dashboard.",
+        { tags: "warning", priority: "high" }
+      );
       return;
     }
   }
@@ -673,6 +955,7 @@ function saveReading(input) {
   const saved = { id: result.lastInsertRowid, ...reading };
   const payload = enrichReading(saved);
   broadcastEvent("reading", payload);
+  checkWaterAlerts(saved);
   evaluatePumpControl();
   return payload;
 }
@@ -819,6 +1102,7 @@ app.get("/api/readings", (req, res) => {
 
 app.get("/api/health", (req, res) => {
   const latest = statements.latest.get();
+  const alertSettings = getAlertSettings();
   res.json({
     ok: true,
     mode: serialState.mode,
@@ -827,9 +1111,9 @@ app.get("/api/health", (req, res) => {
     latest: enrichReading(latest),
     thresholds: {
       maxFeet: CONFIG.maxFeet,
-      lowWarningFeet: CONFIG.alarm.lowWarningFeet,
-      criticalFeet: CONFIG.alarm.criticalFeet,
-      fullFeet: CONFIG.alarm.fullFeet
+      lowWarningFeet: alertSettings.lowWarningFeet,
+      criticalFeet: alertSettings.criticalFeet,
+      fullFeet: alertSettings.fullFeet
     },
     retentionDays: CONFIG.retentionDays,
     uptimeSeconds: Math.round(process.uptime())
@@ -889,6 +1173,25 @@ app.post("/api/config/ntfy/test", async (req, res) => {
     const settings = getNtfySettings();
     await sendNtfyNotification(settings, "Test notification from the Camp ASCCA water tower monitor.");
     res.json({ ok: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/config/alerts", (req, res) => {
+  res.json(getAlertSettings());
+});
+
+app.post("/api/config/alerts", (req, res) => {
+  if (req.body?.confirm !== true) {
+    res.status(400).json({ error: "Alert settings changes require confirm=true." });
+    return;
+  }
+
+  try {
+    const next = sanitizeAlertSettings(req.body);
+    saveStoredJsonSetting("alerts", next);
+    res.json(next);
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -966,20 +1269,100 @@ const server = app.listen(CONFIG.port, CONFIG.host, () => {
   pruneOldReadings();
   setInterval(pruneOldReadings, clamp(CONFIG.pruneIntervalHours, 1, 168) * 60 * 60 * 1000).unref();
   setInterval(evaluatePumpControl, 60 * 1000).unref();
+  // Re-drive the physical relay far more often than we re-evaluate control
+  // logic, so a relay that latches on by itself is forced back off within
+  // seconds rather than waiting up to a minute for the next control tick.
+  setInterval(reassertPumpOutput, 10 * 1000).unref();
   startSerialReader();
 });
 
 function shutdown(signal) {
   console.log(`${signal} received, shutting down.`);
-  server.close(() => {
-    for (const client of sseClients) client.end();
-    setPumpOn(false, "Server shutdown.", statements.latest.get());
-    if (pumpOutput?.kind === "gpio") pumpOutput.gpio.unexport();
-    if (pumpOutput?.kind === "usb_relay" && pumpOutput.port.isOpen) pumpOutput.port.close();
+
+  // Pump safety must never wait on HTTP connections draining: a long-lived
+  // SSE client (the dashboard's /events stream) keeps server.close()'s
+  // callback from ever firing, which previously meant the pump-off below
+  // never ran and the process hung indefinitely on SIGTERM. Turn the pump
+  // off and release hardware first, unconditionally, then best-effort close
+  // the HTTP server with a hard timeout backstop.
+  setPumpOn(false, "Server shutdown.", statements.latest.get());
+  if (pumpOutput?.kind === "gpio") pumpOutput.gpio.unexport();
+  if (pumpOutput?.kind === "usb_relay" && pumpOutput.port?.isOpen) pumpOutput.port.close();
+
+  for (const client of sseClients) client.end();
+
+  let exited = false;
+  const finish = () => {
+    if (exited) return;
+    exited = true;
     db.close();
     process.exit(0);
+  };
+
+  const forceExitTimer = setTimeout(() => {
+    console.warn("Shutdown timed out waiting for connections to close; forcing exit.");
+    finish();
+  }, 5000);
+  forceExitTimer.unref();
+
+  server.close(() => {
+    clearTimeout(forceExitTimer);
+    finish();
   });
+
+  if (typeof server.closeAllConnections === "function") {
+    server.closeAllConnections();
+  }
+}
+
+function emergencyPumpOff(reason) {
+  console.error(reason);
+  try {
+    writePumpOutput(false);
+  } catch (writeError) {
+    console.error(`Emergency pump-off write failed: ${writeError.message}`);
+  }
+  try {
+    pumpState.pumpOn = false;
+    pumpState.reason = reason;
+    logPumpEvent("off", reason, statements.latest.get());
+  } catch (logError) {
+    console.error(`Emergency pump-off event logging failed: ${logError.message}`);
+  }
+  // Best-effort only: the process is about to exit, so this POST may not finish
+  // flushing before then. The watchdog's liveness check is the reliable path
+  // that will notify if this crash keeps the app from answering. We still try
+  // here so a one-off recovered crash gets reported too.
+  try {
+    sendPumpAlert(
+      "Water monitor crashed - pump forced off",
+      "The monitor software hit an error. It forced the pump OFF on the way down as a safety measure and is restarting itself.\n\n" +
+      "WHAT TO DO:\n" +
+      "1. Usually nothing - it restarts on its own within a minute.\n" +
+      "2. Open the dashboard in a minute to confirm the level is showing again.\n" +
+      "3. If you keep getting this message, the Raspberry Pi needs a restart or maintenance.",
+      { tags: "warning", priority: "high" }
+    );
+  } catch (alertError) {
+    console.error(`Emergency pump-off alert failed: ${alertError.message}`);
+  }
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// Last-resort safety net: a crash must never leave the relay energized.
+// GPIO writes are synchronous and complete before exit; the USB relay write
+// and the crash notification are fire-and-forget over the network/serial, so
+// exit is delayed briefly to give both a chance to flush. This does not
+// protect against SIGKILL or host power loss - only fail-open relay/contactor
+// wiring protects against those.
+process.on("uncaughtException", (error) => {
+  emergencyPumpOff(`Uncaught exception, forcing pump off: ${error.stack || error.message}`);
+  setTimeout(() => process.exit(1), 750);
+});
+
+process.on("unhandledRejection", (reason) => {
+  emergencyPumpOff(`Unhandled rejection, forcing pump off: ${reason instanceof Error ? reason.stack : reason}`);
+  setTimeout(() => process.exit(1), 750);
+});

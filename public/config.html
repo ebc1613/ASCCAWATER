@@ -21,6 +21,57 @@
       <section class="panel config-panel">
         <div class="section-head">
           <div>
+            <p class="label">Alerts</p>
+            <h2>Water Level Thresholds &amp; Alerts</h2>
+          </div>
+          <div class="config-status" id="alertStatus">Loading</div>
+        </div>
+
+        <form class="config-form" id="alertForm">
+          <label>
+            <span>Low Warning Level (ft)</span>
+            <input id="alertLowWarningFeet" name="lowWarningFeet" type="number" min="0.1" max="7.8" step="0.1" placeholder="2.0">
+          </label>
+
+          <label>
+            <span>Critical Level (ft)</span>
+            <input id="alertCriticalFeet" name="criticalFeet" type="number" min="0.1" max="7.6" step="0.1" placeholder="1.0">
+          </label>
+
+          <label>
+            <span>Near Full Level (ft)</span>
+            <input id="alertFullFeet" name="fullFeet" type="number" min="0.1" max="8.0" step="0.1" placeholder="7.5">
+          </label>
+
+          <label class="toggle-row">
+            <input id="alertLowWaterEnabled" name="lowWaterAlertsEnabled" type="checkbox">
+            <span>Notify on low/critical water and recovery</span>
+          </label>
+
+          <label class="toggle-row">
+            <input id="alertRapidLossEnabled" name="rapidLossAlertsEnabled" type="checkbox">
+            <span>Notify on rapid water loss</span>
+          </label>
+
+          <label>
+            <span>Rapid Loss Amount (ft)</span>
+            <input id="alertRapidLossFeet" name="rapidLossFeet" type="number" min="0.1" max="8.0" step="0.1" placeholder="1.0">
+          </label>
+
+          <label>
+            <span>Rapid Loss Window (minutes)</span>
+            <input id="alertRapidLossMinutes" name="rapidLossMinutes" type="number" min="5" max="720" step="5" placeholder="30">
+          </label>
+
+          <div class="config-actions">
+            <button id="saveAlertButton" type="submit">Save Thresholds &amp; Alerts</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="section-head">
+          <div>
             <p class="label">ntfy</p>
             <h2>LAN Notification Server</h2>
           </div>
@@ -105,6 +156,18 @@
               <input id="pumpUsbRelayBaud" name="usbRelayBaud" type="number" min="1200" max="115200" step="1" placeholder="9600">
             </label>
             <button id="refreshSerialPortsButton" type="button">Refresh Port List</button>
+
+            <label class="toggle-row">
+              <input id="pumpUsbRelayLockToIdentity" type="checkbox">
+              <span>Lock to this USB device (recommended)</span>
+            </label>
+            <p class="last-update">
+              Cheap relay boards often have no serial number, so their port path can change every time
+              they disconnect and reconnect. Locking to the selected device's vendor/product ID finds it
+              by hardware identity instead of a fixed path, so reconnects keep working automatically.
+              The port path above is kept as a fallback if no match is found.
+            </p>
+            <p class="config-status" id="pumpUsbRelayIdentity"></p>
           </div>
 
           <p class="last-update">Changing this requires an app restart to take effect.</p>

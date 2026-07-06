@@ -1,0 +1,24 @@
+[Unit]
+Description=Campsite Water Tower Pump Watchdog
+# Order after the main app when both start together, but do NOT make the
+# watchdog depend on it. This is the independent safety net: it must come up
+# and stay up even when water-monitor.service is stopped, failed, or crashed
+# at boot - which is exactly when an unattended pump most needs a cutoff.
+After=water-monitor.service
+
+[Service]
+Type=simple
+User=watermonitor
+Group=watermonitor
+WorkingDirectory=/opt/water-monitor
+Environment=PORT=80
+Environment=PUMP_GPIO_PIN=17
+EnvironmentFile=-/etc/default/water-monitor
+ExecStart=/usr/bin/node /opt/water-monitor/scripts/pump-watchdog.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

@@ -24,7 +24,13 @@
     "better-sqlite3": "^11.8.1",
     "express": "^4.21.2",
     "onoff": "^6.0.3",
-    "serialport": "^12.0.0"
+    "pptxgenjs": "^4.0.1",
+    "puppeteer-core": "^25.2.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-icons": "^5.6.0",
+    "serialport": "^12.0.0",
+    "sharp": "^0.35.2"
   },
   "engines": {
     "node": ">=20"

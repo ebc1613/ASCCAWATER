@@ -1,5 +1,69 @@
 "use strict";
 
+const alertEls = {
+  form: document.getElementById("alertForm"),
+  lowWarningFeet: document.getElementById("alertLowWarningFeet"),
+  criticalFeet: document.getElementById("alertCriticalFeet"),
+  fullFeet: document.getElementById("alertFullFeet"),
+  lowWaterAlertsEnabled: document.getElementById("alertLowWaterEnabled"),
+  rapidLossAlertsEnabled: document.getElementById("alertRapidLossEnabled"),
+  rapidLossFeet: document.getElementById("alertRapidLossFeet"),
+  rapidLossMinutes: document.getElementById("alertRapidLossMinutes"),
+  status: document.getElementById("alertStatus")
+};
+
+function setAlertStatus(text, level = "neutral") {
+  alertEls.status.textContent = text;
+  alertEls.status.className = `config-status ${level}`;
+}
+
+function fillAlertForm(config) {
+  alertEls.lowWarningFeet.value = config.lowWarningFeet ?? 2.0;
+  alertEls.criticalFeet.value = config.criticalFeet ?? 1.0;
+  alertEls.fullFeet.value = config.fullFeet ?? 7.5;
+  alertEls.lowWaterAlertsEnabled.checked = Boolean(config.lowWaterAlertsEnabled);
+  alertEls.rapidLossAlertsEnabled.checked = Boolean(config.rapidLossAlertsEnabled);
+  alertEls.rapidLossFeet.value = config.rapidLossFeet ?? 1.0;
+  alertEls.rapidLossMinutes.value = config.rapidLossMinutes ?? 30;
+  setAlertStatus("Saved", "ok");
+}
+
+function collectAlertForm() {
+  return {
+    lowWarningFeet: Number(alertEls.lowWarningFeet.value),
+    criticalFeet: Number(alertEls.criticalFeet.value),
+    fullFeet: Number(alertEls.fullFeet.value),
+    lowWaterAlertsEnabled: alertEls.lowWaterAlertsEnabled.checked,
+    rapidLossAlertsEnabled: alertEls.rapidLossAlertsEnabled.checked,
+    rapidLossFeet: Number(alertEls.rapidLossFeet.value),
+    rapidLossMinutes: Number(alertEls.rapidLossMinutes.value),
+    confirm: true
+  };
+}
+
+async function loadAlertConfig() {
+  setAlertStatus("Loading");
+  fillAlertForm(await requestJson("/api/config/alerts"));
+}
+
+alertEls.form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!window.confirm("Save water level thresholds and alert settings?")) return;
+
+  try {
+    setAlertStatus("Saving");
+    fillAlertForm(await requestJson("/api/config/alerts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectAlertForm())
+    }));
+  } catch (error) {
+    setAlertStatus(error.message, "error");
+  }
+});
+
+loadAlertConfig().catch((error) => setAlertStatus(error.message, "error"));
+
 const els = {
   form: document.getElementById("ntfyForm"),
   enabled: document.getElementById("ntfyEnabled"),
@@ -25,6 +89,8 @@ const pumpOutputEls = {
   usbRelayPort: document.getElementById("pumpUsbRelayPort"),
   usbRelayBaud: document.getElementById("pumpUsbRelayBaud"),
   refreshPortsButton: document.getElementById("refreshSerialPortsButton"),
+  usbRelayLockToIdentity: document.getElementById("pumpUsbRelayLockToIdentity"),
+  usbRelayIdentity: document.getElementById("pumpUsbRelayIdentity"),
   status: document.getElementById("pumpOutputStatus"),
   recommendation: document.getElementById("pumpOutputRecommendation")
 };
@@ -161,6 +227,23 @@ function getSelectedUsbRelayPort() {
   return value === CUSTOM_PORT_VALUE ? pumpOutputEls.usbRelayPort.value.trim() : value;
 }
 
+function getSelectedUsbRelayIdentity() {
+  const path = getSelectedUsbRelayPort();
+  return knownSerialPorts.find((port) => port.path === path) || null;
+}
+
+function updateUsbRelayIdentityDisplay() {
+  const identity = getSelectedUsbRelayIdentity();
+  if (identity && identity.vendorId && identity.productId) {
+    pumpOutputEls.usbRelayLockToIdentity.disabled = false;
+    pumpOutputEls.usbRelayIdentity.textContent = `Detected device: ${identity.vendorId}:${identity.productId}`;
+  } else {
+    pumpOutputEls.usbRelayLockToIdentity.checked = false;
+    pumpOutputEls.usbRelayLockToIdentity.disabled = true;
+    pumpOutputEls.usbRelayIdentity.textContent = "This port has no vendor/product ID to lock to (custom path, or device has none).";
+  }
+}
+
 async function refreshSerialPorts(selectedPath) {
   const { ports } = await requestJson("/api/system/serial-ports");
   knownSerialPorts = ports;
@@ -198,17 +281,27 @@ async function fillPumpOutputForm(config) {
     pumpOutputEls.usbRelayPort.value = config.usbRelayPort || "";
     setPumpOutputStatus(`Could not list serial ports: ${error.message}`, "error");
   }
+  pumpOutputEls.usbRelayLockToIdentity.checked = Boolean(config.usbRelayVendorId && config.usbRelayProductId);
+  updateUsbRelayIdentityDisplay();
+  if (config.usbRelayVendorId && config.usbRelayProductId) {
+    pumpOutputEls.usbRelayLockToIdentity.checked = true;
+    pumpOutputEls.usbRelayLockToIdentity.disabled = false;
+    pumpOutputEls.usbRelayIdentity.textContent = `Locked to device: ${config.usbRelayVendorId}:${config.usbRelayProductId}`;
+  }
   updatePumpOutputFieldVisibility();
   setPumpOutputStatus("Saved", "ok");
 }
 
 function collectPumpOutputForm() {
+  const identity = pumpOutputEls.usbRelayLockToIdentity.checked ? getSelectedUsbRelayIdentity() : null;
   return {
     type: pumpOutputEls.type.value,
     gpioPin: Number(pumpOutputEls.gpioPin.value),
     gpioActiveHigh: pumpOutputEls.gpioActiveHigh.checked,
     usbRelayPort: getSelectedUsbRelayPort(),
     usbRelayBaud: Number(pumpOutputEls.usbRelayBaud.value),
+    usbRelayVendorId: identity?.vendorId || "",
+    usbRelayProductId: identity?.productId || "",
     confirm: true
   };
 }
@@ -219,7 +312,10 @@ async function loadPumpOutputConfig() {
 }
 
 pumpOutputEls.type.addEventListener("change", updatePumpOutputFieldVisibility);
-pumpOutputEls.usbRelayPortSelect.addEventListener("change", updateCustomPortVisibility);
+pumpOutputEls.usbRelayPortSelect.addEventListener("change", () => {
+  updateCustomPortVisibility();
+  updateUsbRelayIdentityDisplay();
+});
 pumpOutputEls.refreshPortsButton.addEventListener("click", () => {
   refreshSerialPorts(getSelectedUsbRelayPort()).catch((error) => setPumpOutputStatus(error.message, "error"));
 });

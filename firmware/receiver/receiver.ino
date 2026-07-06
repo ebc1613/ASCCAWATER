@@ -59,24 +59,50 @@ void setup() {
   radio.setCodingRate(LORA_CODING_RATE);
 }
 
+// Sensor is 5 PSI full scale; anything well outside that range is a wiring
+// fault or corrupt frame, not real water. Dropping it here keeps a bogus
+// reading from ever reaching the pump auto-control on the Pi. Note this only
+// rejects out-of-range values - it cannot detect a sensor stuck reading a
+// plausible-but-wrong level, which is why the Pi still enforces max-runtime
+// and a physical float switch is the real overflow backstop (see README).
+const float MIN_VALID_PSI = -0.2f;
+const float MAX_VALID_PSI = 6.0f;
+
 void loop() {
   TankPacket packet;
-  size_t len = sizeof(packet);
 
   // Blocks until a packet arrives (no timeout set), which is fine since this
   // node has nothing else to do but listen.
-  int state = radio.receive((uint8_t *)&packet, len);
+  int state = radio.receive((uint8_t *)&packet, sizeof(packet));
 
-  if (state == RADIOLIB_ERR_NONE && len == sizeof(packet)) {
-    float rssi = radio.getRSSI();
-    float snr = radio.getSNR();
-    float feet = packet.psi * FEET_PER_PSI;
-
-    Serial.printf(
-      "{\"tower\":\"%s\",\"feet\":%.2f,\"psi\":%.2f,\"battery\":%.2f,\"rssi\":%.1f,\"snr\":%.1f,\"seq\":%lu}\n",
-      TOWER_NAME, feet, packet.psi, packet.batteryVolts, rssi, snr, (unsigned long)packet.seq
-    );
-  } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
-    Serial.printf("Receive error, code %d\n", state);
+  if (state == RADIOLIB_ERR_RX_TIMEOUT) {
+    return;
   }
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.printf("Receive error, code %d\n", state);
+    return;
+  }
+
+  // receive() does not update the length when given a fixed-size buffer, so
+  // check the radio's own record of the last packet to reject anything that
+  // is not exactly our struct (stray traffic, truncated frame).
+  if (radio.getPacketLength() != sizeof(packet)) {
+    Serial.printf("Dropped packet: unexpected length %u\n",
+                  (unsigned)radio.getPacketLength());
+    return;
+  }
+
+  if (!isfinite(packet.psi) || packet.psi < MIN_VALID_PSI || packet.psi > MAX_VALID_PSI) {
+    Serial.printf("Dropped packet: psi out of range (%.2f)\n", packet.psi);
+    return;
+  }
+
+  float rssi = radio.getRSSI();
+  float snr = radio.getSNR();
+  float feet = packet.psi * FEET_PER_PSI;
+
+  Serial.printf(
+    "{\"tower\":\"%s\",\"feet\":%.2f,\"psi\":%.2f,\"battery\":%.2f,\"rssi\":%.1f,\"snr\":%.1f,\"seq\":%lu}\n",
+    TOWER_NAME, feet, packet.psi, packet.batteryVolts, rssi, snr, (unsigned long)packet.seq
+  );
 }
