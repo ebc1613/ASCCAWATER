@@ -72,7 +72,7 @@ Environment variables:
 - `PUMP_USB_RELAY_BAUD`: USB relay serial baud rate, default `9600`
 - `PUMP_USB_RELAY_VENDOR_ID` / `PUMP_USB_RELAY_PRODUCT_ID`: optional hex USB vendor/product ID (for example `1a86`/`7523` for a common CH340-based relay). When both are set, the app finds the relay by hardware identity at every (re)connect instead of trusting `PUMP_USB_RELAY_PORT` as a fixed path - see "USB Relay Path Stability" below. The `/config.html` "Lock to this USB device" checkbox sets this from the dashboard and takes precedence over these env vars once saved.
 - `NTFY_ENABLED`: enable ntfy notifications, default `false`
-- `NTFY_SERVER_URL`: LAN ntfy server URL, for example `http://192.168.1.50:8081`
+- `NTFY_SERVER_URL`: ntfy server URL. This deployment self-hosts ntfy on the same Pi as the app, so it's normally `http://127.0.0.1:8081` (or the Pi's own LAN IP) - see the limitation noted under "Notification Settings" below.
 - `NTFY_TOPIC`: ntfy topic, for example `camp-ascca-water`
 - `NTFY_TOKEN`: optional bearer token for protected ntfy servers
 
@@ -196,6 +196,13 @@ Backup watchdog alerts (from `scripts/pump-watchdog.js`, the independent process
 - **Water monitor back online**: the main app is responding again (reminds staff the pump was left in Manual Off and must be turned back on if needed).
 
 The watchdog reads the same ntfy settings from the database that you set in `/config.html`, so there is nothing separate to configure - just enable notifications once. Emergency messages are sent at ntfy `urgent` priority with a siren tag; warnings at `high` with a warning tag; all-clears at normal priority. (Emoji live in the ntfy tags, not the title, because HTTP headers cannot carry emoji.)
+
+**Important limitation: notifications cannot cover the whole Pi going down.** The ntfy server is self-hosted on this same Raspberry Pi, so if the Pi loses power, hard-freezes, or otherwise dies completely, ntfy dies with it and **no notification can be sent** - there's nothing left on the box to send one. This is exactly the "monitor unreachable" scenario the watchdog alert is meant to cover, but it only reaches you if the Pi itself (and its network connection) is still up and just the main app process is unhealthy or unresponsive.
+
+If silent total-Pi failure is a real risk for your site (e.g. no one walks by the well house daily), the only ways to catch it are outside this box:
+
+- Host ntfy elsewhere (a phone app polling this Pi's `/api/health` on a schedule, another always-on device on the LAN running ntfy, or an external uptime/ping service if this network reaches the internet), so the alert channel survives the Pi dying.
+- Or, simplest and free: have someone glance at the dashboard once a day. A blank/unreachable page is the same signal a notification would have given you.
 
 ## API
 
