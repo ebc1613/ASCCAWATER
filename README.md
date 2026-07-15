@@ -255,10 +255,10 @@ sudo systemctl enable --now water-monitor-watchdog
 
 The watchdog service is only useful once pump control is wired up; see [Failure-Safe Mode](#failure-safe-mode) below.
 
-Or run the Pi installer from the project directory:
+Or run the installer from the project directory (works on the Pi or any systemd Linux box, e.g. an x86 laptop):
 
 ```bash
-sudo bash scripts/install-pi.sh
+sudo bash scripts/install.sh
 ```
 
 View logs:
