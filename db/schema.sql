@@ -31,3 +31,13 @@ CREATE TABLE IF NOT EXISTS pump_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pump_events_timestamp ON pump_events(timestamp DESC);
+
+-- Rolled-up water usage per local calendar day, in gallons. Kept separate from
+-- readings so long-term usage history survives the readings retention window
+-- (readings are pruned after RETENTION_DAYS; these tiny daily rows are not).
+CREATE TABLE IF NOT EXISTS daily_usage (
+  day TEXT PRIMARY KEY,            -- local calendar date, YYYY-MM-DD
+  gallons REAL NOT NULL,          -- estimated water consumed that day
+  pump_rate REAL,                 -- gal/min pump inflow rate used for the estimate
+  computed_at TEXT NOT NULL
+);

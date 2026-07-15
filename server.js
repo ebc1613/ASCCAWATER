@@ -65,6 +65,15 @@ const CONFIG = {
   host: process.env.HOST || "0.0.0.0",
   port: Number.parseInt(process.env.PORT || "80", 10),
   serialPort: process.env.SERIAL_PORT || "/dev/ttyUSB0",
+  // The ESP32 receiver and the USB pump relay are BOTH USB-serial devices on the same
+  // machine, and the OS can renumber their /dev paths across a reboot or reconnect. To
+  // keep them straight, the sensor is matched by USB vendor/product ID (default = the
+  // Heltec V3's CP2102 bridge, 10c4:ea60) rather than trusting a fixed path; if no match
+  // is found we fall back to serialPort. The relay is matched by its own VID/PID the same
+  // way (PUMP_USB_RELAY_VENDOR_ID/PRODUCT_ID) - as long as the two devices use different
+  // bridges (CP2102 sensor vs CH340 relay), they can never grab each other's port.
+  serialVendorId: process.env.SERIAL_VENDOR_ID || "10c4",
+  serialProductId: process.env.SERIAL_PRODUCT_ID || "ea60",
   baudRate: Number.parseInt(process.env.BAUD_RATE || "115200", 10),
   simulate: String(process.env.SIMULATE || "").toLowerCase() === "true",
   dbPath: process.env.DB_PATH || path.join(__dirname, "water-monitor.sqlite"),
@@ -151,6 +160,42 @@ const statements = {
   insertPumpEvent: db.prepare(`
     INSERT INTO pump_events (timestamp, action, reason, mode, pump_on, feet, settings)
     VALUES (@timestamp, @action, @reason, @mode, @pump_on, @feet, @settings)
+  `),
+  readingsBetween: db.prepare(`
+    SELECT feet, timestamp
+    FROM readings
+    WHERE timestamp > ? AND timestamp <= ?
+    ORDER BY timestamp ASC, id ASC
+  `),
+  firstReadingTime: db.prepare(`
+    SELECT timestamp FROM readings ORDER BY timestamp ASC, id ASC LIMIT 1
+  `),
+  pumpEventsBetween: db.prepare(`
+    SELECT timestamp, pump_on
+    FROM pump_events
+    WHERE timestamp > ? AND timestamp <= ?
+    ORDER BY timestamp ASC, id ASC
+  `),
+  lastPumpStateBefore: db.prepare(`
+    SELECT pump_on
+    FROM pump_events
+    WHERE timestamp <= ?
+    ORDER BY timestamp DESC, id DESC
+    LIMIT 1
+  `),
+  upsertDailyUsage: db.prepare(`
+    INSERT INTO daily_usage (day, gallons, pump_rate, computed_at)
+    VALUES (@day, @gallons, @pump_rate, @computed_at)
+    ON CONFLICT(day) DO UPDATE SET
+      gallons = excluded.gallons,
+      pump_rate = excluded.pump_rate,
+      computed_at = excluded.computed_at
+  `),
+  dailyUsageRange: db.prepare(`
+    SELECT day, gallons
+    FROM daily_usage
+    WHERE day >= ? AND day <= ?
+    ORDER BY day ASC
   `)
 };
 
