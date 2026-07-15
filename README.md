@@ -261,6 +261,17 @@ Or run the installer from the project directory (works on the Pi or any systemd 
 sudo bash scripts/install.sh
 ```
 
+By default the installer also sets up two optional pieces of infrastructure:
+
+- **ntfy**, installed from its official apt repo and started as a systemd service (`ntfy.service`) listening on port `8081` on all interfaces, matching the `NTFY_SERVER_URL` default in `.env.example`. Notifications stay off (`NTFY_ENABLED=false`) until you set a topic and enable them from `/config.html`.
+- **Tailscale**, installed from its official apt repo and started as a systemd service (`tailscaled`), but **not connected**. Authenticating the box (`sudo tailscale up`) opens a login link and requires a human, so the installer stops short of that step - run it yourself once the install finishes.
+
+Skip either one with `INSTALL_NTFY=false` or `INSTALL_TAILSCALE=false`:
+
+```bash
+sudo INSTALL_NTFY=false INSTALL_TAILSCALE=false bash scripts/install.sh
+```
+
 View logs:
 
 ```bash
