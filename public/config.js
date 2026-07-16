@@ -185,6 +185,7 @@ function updatePumpOutputFieldVisibility() {
 }
 
 let knownSerialPorts = [];
+let knownSensorPort = "";
 
 function updateCustomPortVisibility() {
   const isCustom = pumpOutputEls.usbRelayPortSelect.value === CUSTOM_PORT_VALUE;
@@ -205,7 +206,9 @@ function populatePortSelect(selectedPath) {
   for (const port of knownSerialPorts) {
     const option = document.createElement("option");
     option.value = port.path;
-    option.textContent = port.manufacturer ? `${port.path} (${port.manufacturer})` : port.path;
+    const isSensor = Boolean(knownSensorPort) && port.path === knownSensorPort;
+    const label = port.manufacturer ? `${port.path} (${port.manufacturer})` : port.path;
+    option.textContent = isSensor ? `${label} - water sensor, not the relay` : label;
     select.appendChild(option);
   }
 
@@ -215,7 +218,14 @@ function populatePortSelect(selectedPath) {
   select.appendChild(customOption);
 
   const matchesDetected = Boolean(selectedPath) && knownSerialPorts.some((port) => port.path === selectedPath);
-  select.value = matchesDetected ? selectedPath : (selectedPath ? CUSTOM_PORT_VALUE : (knownSerialPorts[0]?.path || CUSTOM_PORT_VALUE));
+  // Never silently default the picker to the sensor's own port - an unset
+  // relay port should fall through to "Custom path..." instead, forcing a
+  // deliberate choice, rather than pre-selecting whichever device the OS
+  // happened to enumerate first (which is often the sensor).
+  const firstNonSensorPort = knownSerialPorts.find((port) => port.path !== knownSensorPort);
+  select.value = matchesDetected
+    ? selectedPath
+    : (selectedPath ? CUSTOM_PORT_VALUE : (firstNonSensorPort?.path || CUSTOM_PORT_VALUE));
   if (!matchesDetected && selectedPath) {
     pumpOutputEls.usbRelayPort.value = selectedPath;
   }
@@ -234,7 +244,14 @@ function getSelectedUsbRelayIdentity() {
 
 function updateUsbRelayIdentityDisplay() {
   const identity = getSelectedUsbRelayIdentity();
-  if (identity && identity.vendorId && identity.productId) {
+  const isSensorPort = Boolean(knownSensorPort) && getSelectedUsbRelayPort() === knownSensorPort;
+
+  if (isSensorPort) {
+    pumpOutputEls.usbRelayLockToIdentity.checked = false;
+    pumpOutputEls.usbRelayLockToIdentity.disabled = true;
+    pumpOutputEls.usbRelayIdentity.textContent =
+      "This is the water-level sensor's port, not the relay - pick a different port before locking.";
+  } else if (identity && identity.vendorId && identity.productId) {
     pumpOutputEls.usbRelayLockToIdentity.disabled = false;
     pumpOutputEls.usbRelayIdentity.textContent = `Detected device: ${identity.vendorId}:${identity.productId}`;
   } else {
@@ -245,8 +262,9 @@ function updateUsbRelayIdentityDisplay() {
 }
 
 async function refreshSerialPorts(selectedPath) {
-  const { ports } = await requestJson("/api/system/serial-ports");
+  const { ports, sensorPort } = await requestJson("/api/system/serial-ports");
   knownSerialPorts = ports;
+  knownSensorPort = sensorPort || "";
   populatePortSelect(selectedPath);
 }
 

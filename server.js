@@ -449,6 +449,22 @@ function sanitizePumpOutputSettings(input) {
   const type = input.type === "usb_relay" ? "usb_relay" : "gpio";
   const gpioPin = Math.round(clamp(Number(input.gpioPin), 0, 40));
   const usbRelayBaud = Math.round(clamp(Number(input.usbRelayBaud), 1200, 115200));
+  let usbRelayVendorId = sanitizeUsbHexId(input.usbRelayVendorId);
+  let usbRelayProductId = sanitizeUsbHexId(input.usbRelayProductId);
+
+  // Refuse to lock the relay onto the water-level sensor's own identity -
+  // this is exactly the mix-up a bare port-picker UI invites (both devices
+  // are USB-serial adapters on the same machine), and it would make the
+  // relay driver "find" and drive the sensor's port instead of the relay's.
+  if (
+    usbRelayVendorId &&
+    usbRelayProductId &&
+    usbRelayVendorId === CONFIG.serialVendorId.toLowerCase() &&
+    usbRelayProductId === CONFIG.serialProductId.toLowerCase()
+  ) {
+    usbRelayVendorId = "";
+    usbRelayProductId = "";
+  }
 
   return {
     type,
@@ -456,8 +472,8 @@ function sanitizePumpOutputSettings(input) {
     gpioActiveHigh: Boolean(input.gpioActiveHigh),
     usbRelayPort: String(input.usbRelayPort || "").trim(),
     usbRelayBaud: Number.isFinite(usbRelayBaud) ? usbRelayBaud : DEFAULT_PUMP_OUTPUT_SETTINGS.usbRelayBaud,
-    usbRelayVendorId: sanitizeUsbHexId(input.usbRelayVendorId),
-    usbRelayProductId: sanitizeUsbHexId(input.usbRelayProductId)
+    usbRelayVendorId,
+    usbRelayProductId
   };
 }
 
@@ -1130,7 +1146,12 @@ app.get("/api/system/serial-ports", async (req, res) => {
         serialNumber: port.serialNumber || null,
         vendorId: port.vendorId || null,
         productId: port.productId || null
-      }))
+      })),
+      // So the relay port picker can avoid defaulting to (or silently
+      // accepting a "lock to this device" on) the water-level sensor's own
+      // port - the sensor and the relay are both USB-serial devices on the
+      // same machine and are easy to mix up from a bare port list.
+      sensorPort: CONFIG.serialPort
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
