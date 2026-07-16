@@ -54,9 +54,9 @@ if [[ "${INSTALL_NTFY}" == "true" ]]; then
     apt-get update
     apt-get install -y apt-transport-https gnupg curl
     mkdir -p /etc/apt/keyrings
-    curl -fsSL https://archive.heckel.io/apt/pubkey.txt | gpg --dearmor -o /etc/apt/keyrings/archive.heckel.io.gpg
-    echo "deb [signed-by=/etc/apt/keyrings/archive.heckel.io.gpg] https://archive.heckel.io/apt debian main" \
-      > /etc/apt/sources.list.d/archive.heckel.io.list
+    curl -fsSL -o /etc/apt/keyrings/ntfy.gpg https://archive.ntfy.sh/apt/keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/ntfy.gpg] https://archive.ntfy.sh/apt stable main" \
+      > /etc/apt/sources.list.d/ntfy.list
     apt-get update
     apt-get install -y ntfy
   fi
