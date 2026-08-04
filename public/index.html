@@ -40,9 +40,9 @@
           <div class="tank-wrap" aria-label="Tank fill graphic">
             <div class="tank">
               <div class="tank-fill" id="tankFill"></div>
-              <div class="tank-mark top">8 ft</div>
-              <div class="tank-mark low">2 ft</div>
-              <div class="tank-mark critical">1 ft</div>
+              <div class="tank-mark top" id="tankMarkFull"></div>
+              <div class="tank-mark low" id="tankMarkLow"></div>
+              <div class="tank-mark critical" id="tankMarkCritical"></div>
             </div>
           </div>
         </article>
@@ -67,11 +67,11 @@
         <form class="pump-settings" id="pumpSettingsForm">
           <label>
             <span>On Below</span>
-            <input id="pumpOnFeet" name="autoOnFeet" type="number" min="0.1" max="7.5" step="0.1" value="2.0">
+            <input id="pumpOnFeet" name="autoOnFeet" type="number" min="0.1" max="7.2" step="0.1" value="2.0">
           </label>
           <label>
             <span>Off At</span>
-            <input id="pumpOffFeet" name="autoOffFeet" type="number" min="0.6" max="8.0" step="0.1" value="7.2">
+            <input id="pumpOffFeet" name="autoOffFeet" type="number" min="0.6" max="7.2" step="0.1" value="7.2">
           </label>
           <label>
             <span>No Signal Stop</span>
@@ -125,6 +125,51 @@
         </p>
       </section>
 
+      <section class="panel runs-panel" aria-label="Pump run history">
+        <div class="section-head">
+          <div>
+            <p class="label">Pump Runs</p>
+            <h2>How Long the Pump Ran</h2>
+          </div>
+          <div class="trend-actions" aria-label="Run history range">
+            <button class="trend-range active" type="button" data-days="7">7 Days</button>
+            <button class="trend-range" type="button" data-days="30">30 Days</button>
+            <button class="trend-range" type="button" data-days="365">1 Year</button>
+          </div>
+        </div>
+
+        <div class="usage-grid">
+          <div class="usage-item">
+            <span>Times Started</span>
+            <strong id="runsCount">--</strong>
+          </div>
+          <div class="usage-item">
+            <span>Total Run Time</span>
+            <strong id="runsTotal">--</strong>
+          </div>
+          <div class="usage-item">
+            <span>Longest Run</span>
+            <strong id="runsLongest">--</strong>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Started</th>
+                <th>Ran For</th>
+                <th>Mode</th>
+                <th>Why It Stopped</th>
+              </tr>
+            </thead>
+            <tbody id="runsBody">
+              <tr><td colspan="4">Loading</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="content-grid">
         <article class="panel trend-panel">
           <div class="section-head">
@@ -139,7 +184,7 @@
           </div>
           <div class="trend-meta">
             <span id="trendRangeLabel">48-hour view</span>
-            <span>8.0 ft max</span>
+            <span id="trendMaxLabel">7.2 ft max</span>
           </div>
           <canvas id="trendCanvas" width="900" height="320"></canvas>
         </article>

@@ -13,6 +13,7 @@ This is monitor-only software. It does not control pumps, valves, chlorinators, 
 - Starts normally when the serial device is missing and shows `Waiting for Data`.
 - Simulation mode for setup and demos.
 - API endpoints for latest reading, recent readings, health, and 48-hour or 7-day trend data.
+- Pump run log showing how long each run lasted and why it stopped.
 
 ## Serial Format
 
@@ -171,7 +172,9 @@ If the app process dies, nothing programmatically changes the relay's state on i
 4. **Continuous re-assertion**: every 10 seconds the app re-sends the *desired* physical state to the relay, not just on transitions. Everywhere else a command is only sent when the on/off decision changes, so a relay that energizes on its own - a welded contact, electrical noise, a brownout on the relay board, or a board that powers up in its last state - would otherwise never get another OFF while the software still thinks it is off. This loop forces such a relay back off within seconds, in either direction.
 5. **`scripts/pump-watchdog.js`** is a separate program from the main app - a different file, a different process, no shared code, run as its own systemd service (`water-monitor-watchdog.service`). It does not require the main app's code to be working at all, only its HTTP API to respond. It enforces two independent backstops:
    - **Liveness**: if `/api/pump/status` stops responding for `WATCHDOG_FAILURE_THRESHOLD` consecutive checks (default 3, ~15s at the default 5s interval), it opens the relay/GPIO directly and forces it off. Covers the main app being dead, deadlocked, or unreachable - a `SIGKILL`, an out-of-memory kill, a native-module segfault, anything that stops it from answering. At watchdog startup only, `WATCHDOG_STARTUP_GRACE_SECONDS` (default 90) is allowed for the main app to come up before silence counts as a failure - systemd starts both services together and `After=` only orders the start, it does not wait for the app to be listening. The grace ends the instant the app answers once, and never applies again for the life of the process, so a crash mid-run is acted on immediately. Nothing is at risk during the window: a relay is de-energized when unpowered, and the main app has not had a chance to energize anything yet either.
-   - **Independent max runtime**: even while the main app is alive and reporting itself healthy, the watchdog tracks how long it has personally observed `pumpOn: true`, using its own clock - not the runtime the main app reports about itself. If that exceeds `WATCHDOG_MAX_RUNTIME_MINUTES`, it forces the relay off regardless of what the main app says. This is what catches a *logic* bug (not a crash) that leaves the pump on - for example, if the main app's own auto-off threshold or max-runtime check were ever wrong, this is a second opinion that does not trust the same code that made the mistake.
+   - **Independent max runtime**: even while the main app is alive and reporting itself healthy, the watchdog tracks how long it has personally observed `pumpOn: true`, using its own clock - not the runtime the main app reports about itself. If that exceeds the ceiling, it forces the relay off regardless of what the main app says. This is what catches a *logic* bug (not a crash) that leaves the pump on - for example, if the main app's own auto-off threshold or max-runtime check were ever wrong, this is a second opinion that does not trust the same code that made the mistake.
+
+     The ceiling is the **Max Run Hours** value set on the dashboard, read from the status endpoint, plus `WATCHDOG_RUNTIME_GRACE_MINUTES` (default 20), capped by `WATCHDOG_MAX_RUNTIME_MINUTES`. Only the elapsed-time *measurement* is independent; the policy is shared on purpose. A fixed limit here meant the watchdog silently overruled the dashboard - a tank configured for a long fill got cut off at 2.5 hours with an urgent "ran too long" alert every time, because the two numbers had to be hand-matched and had drifted apart. Independence is about not trusting the app's observations, not about ignoring the operator's settings. The reported value is validated against the same 1..1440 minute range the app itself accepts, and a bad or missing one leaves the last good ceiling in place, so a corrupted status payload cannot talk the watchdog out of ever cutting off. The grace margin exists so the app's own cleaner stop always runs first and this fires only as a true backstop.
    On either trigger, the watchdog also makes a best-effort direct write to the database to flip the saved pump mode to `manual_off`, so that if the main app comes back, it does not immediately re-energize the pump from a stuck `auto` or `manual_on` setting. This write is why the startup grace matters: without it the watchdog reached its 3-strike threshold roughly 15 seconds into every boot, rewrote the saved pump mode, and pushed an urgent "EMERGENCY cutoff" notification - which looked exactly like the dashboard forgetting its settings on every restart. The physical relay cutoff above does not depend on this write succeeding. The watchdog runs as its own service and, by design, does **not** depend on `water-monitor.service` being up (`After=` ordering only, no `Requisite=`) - it must still come up and stay running when the main app is stopped, failed, or crashed at boot.
 6. **Hardware wiring** is the only layer that survives total power loss to the Pi or relay. Wire the relay/contactor so the pump's *normal, de-energized* state is OFF (see "Recommended hardware pattern" above) - software watchdogs cannot help if the board itself has no power.
 
@@ -183,7 +186,9 @@ Watchdog environment variables (set alongside the other `PUMP_*` variables in `/
 - `WATCHDOG_INTERVAL_SECONDS`: poll interval, default `5`
 - `WATCHDOG_FAILURE_THRESHOLD`: consecutive failed checks before forcing the relay off, default `3`
 - `WATCHDOG_STARTUP_GRACE_SECONDS`: at watchdog startup only, how long to wait for the main app to come up before silence counts as a failure, default `90`. Ends early the moment the main app answers once. Set to `0` to disable, but expect a spurious cutoff and an urgent notification on every boot if the app takes longer than the failure threshold to start listening.
-- `WATCHDOG_MAX_RUNTIME_MINUTES`: independent hard ceiling on continuous pump runtime, default `150` (2.5 hours). Keep this slightly *above* the main app's own max runtime setting (default 120 min) so the app's cleaner stop runs first and this only fires as a true backstop.
+- `WATCHDOG_RUNTIME_GRACE_MINUTES`: how far above the dashboard's Max Run Hours the watchdog's ceiling sits, default `20`. This is the gap that lets the app's own cleaner stop run first.
+- `WATCHDOG_MAX_RUNTIME_MINUTES`: absolute cap on the runtime ceiling regardless of what the app reports, default `1500` (25 hours). The app clamps its own setting to 24 hours, so this normally never binds; it exists so a bad status payload cannot raise the ceiling indefinitely.
+- `WATCHDOG_FALLBACK_RUNTIME_MINUTES`: ceiling used only until the app has reported its setting even once, default `150`.
 
 The watchdog reads the `pumpOutput` setting from the same database file the main app uses (a plain file read, independent of whether the main app process is alive), so it stays in sync with whatever relay hardware was last configured in `/config.html` without needing its own copy of that setting.
 
@@ -277,6 +282,15 @@ Returns the latest reading, percent full, alarm state, and communication status.
 
 Returns recent readings newest first. The limit is clamped between 1 and 1000.
 
+`GET /api/pump/runs?days=30&limit=50`
+
+Returns completed pump runs newest first, with `seconds` for each, plus `totalRuns`, `totalSeconds`, and `longestSeconds` for the window. `days` is clamped 1..730 and `limit` 1..500; the totals always cover the whole window even when the list is truncated.
+
+Runs are **derived** by pairing on/off transitions in `pump_events` rather than recorded in their own table. `pump_events` is never pruned, so the log covers history from before the feature existed. Two runs are not clean pairs and are reported as such:
+
+- `inProgress: true` - the pump is running now; `seconds` is the elapsed time so far and `endedAt` is null.
+- `endedUnexpectedly: true` - an `on` followed by another `on` with no `off` between them. The watchdog cuts the relay directly and a hard kill leaves no chance to log anything, so the true end is unknown. The run is closed at the next event, which is the last moment there is evidence for. That under-reports rather than running the duration forward to now, which would wildly over-report.
+
 `GET /api/health`
 
 Returns process status, serial status, database path, latest reading, thresholds, and uptime.
@@ -303,10 +317,12 @@ Releases and re-opens the pump output, re-scanning for the relay. This is what t
 
 ## Thresholds
 
-- Maximum tank height: `8.0 ft`
+- Maximum tank height: `7.2 ft` (`TANK_MAX_FEET`)
 - Low warning: below `2.0 ft`
 - Critical: below `1.0 ft`
-- Near full: above `7.5 ft`
+- Near full: at or above `7.0 ft`
+
+`TANK_MAX_FEET` is the absolute full level measured in **feet of water above the sensor tap**, not the tank's physical height - the sensor taps in about a foot above the floor, so it reads roughly a foot lower than the tank's own gauge. Percent full, the tank graphic, the trend axis, and the ceiling on every level threshold are all measured against it. Each threshold is clamped to it on read, so lowering it corrects stored settings that no longer fit instead of leaving an alert that can never fire.
 - Green communication status: update within 5 minutes
 - Yellow communication status: update within 10 minutes
 - Red communication status: no update for more than 10 minutes

@@ -1,6 +1,9 @@
 "use strict";
 
-const MAX_FEET = 8.0;
+// The tank's full height, in feet above the sensor tap. Seeded with the server
+// default and corrected from the first reading that arrives, so the trend axis
+// and tank graphic follow TANK_MAX_FEET rather than a number baked in here.
+let MAX_FEET = 7.2;
 const els = {
   feet: document.getElementById("feetValue"),
   percent: document.getElementById("percentValue"),
@@ -12,6 +15,9 @@ const els = {
   commStatus: document.getElementById("commStatus"),
   alarmStatus: document.getElementById("alarmStatus"),
   tankFill: document.getElementById("tankFill"),
+  tankMarkFull: document.getElementById("tankMarkFull"),
+  tankMarkLow: document.getElementById("tankMarkLow"),
+  tankMarkCritical: document.getElementById("tankMarkCritical"),
   readingsBody: document.getElementById("readingsBody"),
   refreshButton: document.getElementById("refreshButton"),
   trendCanvas: document.getElementById("trendCanvas"),
@@ -29,6 +35,11 @@ const els = {
   pumpOffFeet: document.getElementById("pumpOffFeet"),
   pumpStaleMinutes: document.getElementById("pumpStaleMinutes"),
   pumpMaxHours: document.getElementById("pumpMaxHours"),
+  trendMaxLabel: document.getElementById("trendMaxLabel"),
+  runsBody: document.getElementById("runsBody"),
+  runsCount: document.getElementById("runsCount"),
+  runsTotal: document.getElementById("runsTotal"),
+  runsLongest: document.getElementById("runsLongest"),
   pumpBlocked: document.getElementById("pumpBlocked"),
   pumpBlockedHeadline: document.getElementById("pumpBlockedHeadline"),
   pumpBlockedDetail: document.getElementById("pumpBlockedDetail"),
@@ -46,6 +57,7 @@ let recentReadings = [];
 let trendReadings = [];
 let pumpStatus = null;
 let trendHours = 48;
+let runDays = 7;
 
 function formatNumber(value, digits = 1) {
   return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "--";
@@ -114,8 +126,51 @@ function renderLatest(payload) {
   els.snr.textContent = `${formatNumber(reading.snr, 1)} dB`;
   els.lastUpdate.textContent = `${formatTime(reading.timestamp)} ${formatAge(reading.communication?.ageSeconds)}`;
   els.tankFill.style.height = `${Math.max(0, Math.min(100, reading.percentFull))}%`;
+  renderTankMarks(reading);
   setStatus(reading.communication);
   setAlarm(reading.alarm);
+}
+
+// The tank's height markings used to be hardcoded in the markup and stylesheet
+// as "8 ft" with the low and critical lines pinned at 25% and 12.5% - one
+// eighth each. That was only ever right for an 8-foot tank with default alert
+// levels, and it silently misreported both the full height and the thresholds
+// once either changed. Drive them from the same numbers the alarms use.
+function renderTankMarks(reading) {
+  const maxFeet = Number(reading.maxFeet);
+  if (!Number.isFinite(maxFeet) || maxFeet <= 0) return;
+
+  applyTankHeight(maxFeet);
+  els.tankMarkFull.textContent = `${formatNumber(maxFeet, 1)} ft`;
+
+  const place = (el, feet) => {
+    const value = Number(feet);
+    // A threshold at or above the top of the tank has nowhere to sit, and one
+    // at zero is not a level anyone is watching for.
+    if (!Number.isFinite(value) || value <= 0 || value >= maxFeet) {
+      el.hidden = true;
+      return;
+    }
+    el.hidden = false;
+    el.textContent = `${formatNumber(value, 1)} ft`;
+    el.style.bottom = `${(value / maxFeet) * 100}%`;
+  };
+
+  place(els.tankMarkLow, reading.lowWarningFeet);
+  place(els.tankMarkCritical, reading.criticalFeet);
+}
+
+// Adopt the server's tank height everywhere it is baked into the page: the
+// trend chart's y-axis, its printed maximum, and the ceiling on the auto-level
+// inputs. Redraws the trend, since its scale changed under it.
+function applyTankHeight(maxFeet) {
+  if (maxFeet === MAX_FEET) return;
+  MAX_FEET = maxFeet;
+
+  els.trendMaxLabel.textContent = `${formatNumber(maxFeet, 1)} ft max`;
+  els.pumpOnFeet.max = String(maxFeet);
+  els.pumpOffFeet.max = String(maxFeet);
+  if (trendReadings.length) drawTrend();
 }
 
 // Several safety checks run before the selected mode is even consulted, and
@@ -159,9 +214,13 @@ function renderPumpBlock(status) {
 
 function renderPump(status) {
   if (!status) return;
+  // A run only appears in (or leaves) the log when the pump actually switches,
+  // so refresh on the transition rather than on every status push.
+  const wasOn = pumpStatus ? Boolean(pumpStatus.pumpOn) : null;
   pumpStatus = status;
   renderPumpBlock(status);
   const isOn = Boolean(status.pumpOn);
+  if (wasOn !== null && wasOn !== isOn) loadRuns();
   const isFault = Boolean(status.fault);
   const modeLabel = {
     auto: "Auto",
@@ -387,6 +446,77 @@ async function loadUsage() {
   }
 }
 
+// "2h 15m" / "45m" / "38s". Whole hours and minutes are what someone comparing
+// a fill against the pump's max run hours actually needs; seconds only matter
+// for the very short runs where minutes would round to a meaningless "0m".
+function formatRunDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total < 60) return `${total}s`;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.round((total % 3600) / 60);
+  if (!hours) return `${minutes}m`;
+  // 90 min rounds to "1h 30m", but 119.7 min must not become "1h 60m".
+  if (minutes === 60) return `${hours + 1}h 00m`;
+  return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+}
+
+// Includes minutes, unlike the trend axis: "started at 3 PM" is not enough to
+// line a run up against anything.
+function formatRunStart(timestamp) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short", day: "numeric", hour: "numeric", minute: "2-digit"
+  }).format(new Date(timestamp));
+}
+
+const RUN_MODE_LABELS = {
+  auto: "Auto",
+  manual_on: "Manual On",
+  manual_off: "Manual Off"
+};
+
+function renderRuns(payload) {
+  els.runsCount.textContent = payload.totalRuns;
+  els.runsTotal.textContent = formatRunDuration(payload.totalSeconds);
+  els.runsLongest.textContent = formatRunDuration(payload.longestSeconds);
+
+  if (!payload.runs.length) {
+    els.runsBody.innerHTML = `<tr><td colspan="4">The pump did not run in the last ${payload.days} days.</td></tr>`;
+    return;
+  }
+
+  els.runsBody.innerHTML = payload.runs.map((run) => {
+    const started = formatRunStart(run.startedAt);
+    const duration = run.inProgress
+      ? `${formatRunDuration(run.seconds)} <span class="run-flag running">so far</span>`
+      : formatRunDuration(run.seconds);
+    const why = run.inProgress
+      ? "Still running."
+      : escapeHtml(run.endReason || "Unknown.");
+    const flag = run.endedUnexpectedly ? ' <span class="run-flag unrecorded">not recorded</span>' : "";
+    return `<tr>
+      <td>${escapeHtml(started)}</td>
+      <td>${duration}</td>
+      <td>${escapeHtml(RUN_MODE_LABELS[run.mode] || run.mode || "--")}</td>
+      <td>${why}${flag}</td>
+    </tr>`;
+  }).join("");
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
+
+async function loadRuns() {
+  try {
+    const response = await fetch(`/api/pump/runs?days=${runDays}&limit=50`);
+    renderRuns(await response.json());
+  } catch (error) {
+    console.error("Could not load pump runs", error);
+  }
+}
+
 async function loadData() {
   const [latestRes, readingsRes, pumpRes] = await Promise.all([
     fetch("/api/latest"),
@@ -400,6 +530,7 @@ async function loadData() {
   renderTable();
   await loadTrend();
   await loadUsage();
+  await loadRuns();
 }
 
 function connectEvents() {
@@ -451,6 +582,14 @@ els.trend48Button.addEventListener("click", () => {
 els.trend7DayButton.addEventListener("click", () => {
   trendHours = 168;
   loadTrend().catch((error) => window.alert(error.message));
+});
+document.querySelectorAll(".runs-panel .trend-range").forEach((button) => {
+  button.addEventListener("click", () => {
+    runDays = Number(button.dataset.days);
+    document.querySelectorAll(".runs-panel .trend-range")
+      .forEach((other) => other.classList.toggle("active", other === button));
+    loadRuns();
+  });
 });
 els.pumpAutoButton.addEventListener("click", () => setPumpMode("auto").catch((error) => window.alert(error.message)));
 els.pumpManualOnButton.addEventListener("click", () => setPumpMode("manual_on").catch((error) => window.alert(error.message)));

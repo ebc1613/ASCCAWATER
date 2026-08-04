@@ -103,7 +103,10 @@ const CONFIG = {
     topic: process.env.NTFY_TOPIC || "",
     token: process.env.NTFY_TOKEN || ""
   },
-  maxFeet: 8.0,
+  // Absolute full level of the tank, in feet of water above the sensor tap.
+  // Everything derived from "how full is it" - percent full, the tank graphic,
+  // and the clamps on every level threshold - is measured against this.
+  maxFeet: Number.parseFloat(process.env.TANK_MAX_FEET || "7.2"),
   status: {
     greenMs: 5 * 60 * 1000,
     yellowMs: 10 * 60 * 1000
@@ -194,6 +197,12 @@ const statements = {
     SELECT timestamp, pump_on
     FROM pump_events
     WHERE timestamp > ? AND timestamp <= ?
+    ORDER BY timestamp ASC, id ASC
+  `),
+  pumpEventsSince: db.prepare(`
+    SELECT timestamp, action, reason, mode, pump_on, feet
+    FROM pump_events
+    WHERE timestamp >= ?
     ORDER BY timestamp ASC, id ASC
   `),
   lastPumpStateBefore: db.prepare(`
@@ -304,7 +313,11 @@ const DEFAULT_NTFY_SETTINGS = {
 const DEFAULT_ALERT_SETTINGS = {
   criticalFeet: 1.0,
   lowWarningFeet: 2.0,
-  fullFeet: 7.5,
+  // Must stay at or under CONFIG.maxFeet, or the "tank is full" alert can never
+  // fire. sanitizeAlertSettings clamps stored values on read, so an installation
+  // that saved a higher number under an older, taller maxFeet is corrected
+  // automatically rather than silently losing its full alert.
+  fullFeet: 7.0,
   lowWaterAlertsEnabled: true,
   rapidLossAlertsEnabled: true,
   rapidLossFeet: 1.0,
@@ -474,20 +487,39 @@ function getAlarmState(feet, alertSettings = getAlertSettings()) {
   if (feet < alertSettings.lowWarningFeet) {
     return { level: "warning", label: "Low Warning" };
   }
-  if (feet > alertSettings.fullFeet) {
+  // Inclusive on purpose. fullFeet is clamped to at most the tank's maximum, so
+  // an installation whose full level sits exactly at the top of the tank could
+  // never satisfy a strict greater-than - the level has nowhere above to go.
+  if (feet >= alertSettings.fullFeet) {
     return { level: "full", label: "Near Full" };
   }
   return { level: "normal", label: "Normal" };
 }
 
-function enrichReading(row) {
+// The level thresholds the tank graphic labels itself with. Only the
+// single-reading callers ask for these: enrichReading is also mapped over whole
+// trend and history result sets, and getAlertSettings() is a database read, so
+// including them unconditionally would add one query per row.
+function markThresholds() {
+  const alertSettings = getAlertSettings();
+  return {
+    lowWarningFeet: alertSettings.lowWarningFeet,
+    criticalFeet: alertSettings.criticalFeet,
+    fullFeet: alertSettings.fullFeet
+  };
+}
+
+function enrichReading(row, { includeThresholds = false } = {}) {
+  const thresholds = includeThresholds ? markThresholds() : null;
+
   if (!row) {
     return {
       reading: null,
       percentFull: 0,
       communication: getCommunicationStatus(null),
       alarm: getAlarmState(null),
-      maxFeet: CONFIG.maxFeet
+      maxFeet: CONFIG.maxFeet,
+      ...thresholds
     };
   }
 
@@ -497,7 +529,8 @@ function enrichReading(row) {
     percentFull,
     communication: getCommunicationStatus(row.timestamp),
     alarm: getAlarmState(row.feet),
-    maxFeet: CONFIG.maxFeet
+    maxFeet: CONFIG.maxFeet,
+    ...thresholds
   };
 }
 
@@ -1050,6 +1083,82 @@ function reassertPumpOutput() {
   writePumpOutput(pumpState.pumpOn);
 }
 
+// Completed pump runs, reconstructed by pairing on/off transitions in
+// pump_events. Derived rather than recorded in its own table because
+// pump_events is never pruned, so this works over history that predates the
+// feature instead of starting from empty.
+//
+// Not every run has a clean end. The watchdog cuts the relay directly, and a
+// hard kill leaves no chance to log anything, so an "on" can be followed by
+// another "on" with no "off" between them. Those runs get closed at the last
+// moment we have evidence for and flagged, rather than dropped (which would
+// under-report runtime) or run forward to now (which would wildly over-report).
+function getPumpRuns({ sinceIso, limit = 100 }) {
+  const events = statements.pumpEventsSince.all(sinceIso);
+  const runs = [];
+  let open = null;
+
+  const close = (endedAt, endReason, endFeet, endedUnexpectedly) => {
+    const seconds = Math.max(0,
+      Math.round((new Date(endedAt).getTime() - new Date(open.startedAt).getTime()) / 1000));
+    runs.push({ ...open, endedAt, endReason, endFeet, seconds, endedUnexpectedly, inProgress: false });
+    open = null;
+  };
+
+  for (const event of events) {
+    const isOn = Boolean(event.pump_on);
+
+    if (isOn && !open) {
+      open = {
+        startedAt: event.timestamp,
+        startReason: event.reason,
+        startFeet: event.feet,
+        mode: event.mode
+      };
+      continue;
+    }
+
+    // A second "on" with no "off" between: the previous run ended without
+    // being recorded. Its true end is unknown but is no later than this.
+    if (isOn && open) {
+      close(event.timestamp, "Ended without being recorded - the monitor was restarted or the backup safety system cut the pump.", event.feet, true);
+      open = {
+        startedAt: event.timestamp,
+        startReason: event.reason,
+        startFeet: event.feet,
+        mode: event.mode
+      };
+      continue;
+    }
+
+    if (!isOn && open) close(event.timestamp, event.reason, event.feet, false);
+  }
+
+  // A still-running pump is reported with the runtime it has so far, so the log
+  // agrees with the live pump panel instead of omitting the run in progress.
+  if (open) {
+    runs.push({
+      ...open,
+      endedAt: null,
+      endReason: null,
+      endFeet: null,
+      seconds: Math.max(0, Math.round((Date.now() - new Date(open.startedAt).getTime()) / 1000)),
+      endedUnexpectedly: false,
+      inProgress: true
+    });
+  }
+
+  runs.reverse();
+  const totalSeconds = runs.reduce((sum, run) => sum + run.seconds, 0);
+  return {
+    runs: runs.slice(0, limit),
+    totalRuns: runs.length,
+    totalSeconds,
+    longestSeconds: runs.reduce((max, run) => Math.max(max, run.seconds), 0),
+    truncated: runs.length > limit
+  };
+}
+
 function logPumpEvent(action, reason, latest) {
   const settings = getPumpSettings();
   statements.insertPumpEvent.run({
@@ -1206,7 +1315,7 @@ function getPumpStatus() {
     mode: settings.mode,
     runtimeSeconds,
     settings,
-    latest: enrichReading(latest)
+    latest: enrichReading(latest, { includeThresholds: true })
   };
 }
 
@@ -1560,7 +1669,7 @@ function saveReading(input) {
   const reading = normalizeReading(input);
   const result = statements.insertReading.run(reading);
   const saved = { id: result.lastInsertRowid, ...reading };
-  const payload = enrichReading(saved);
+  const payload = enrichReading(saved, { includeThresholds: true });
   broadcastEvent("reading", payload);
   checkWaterAlerts(saved);
   evaluatePumpControl();
@@ -1671,7 +1780,7 @@ app.get("/events", (req, res) => {
   res.flushHeaders?.();
 
   sseClients.add(res);
-  res.write(`event: latest\ndata: ${JSON.stringify(enrichReading(statements.latest.get()))}\n\n`);
+  res.write(`event: latest\ndata: ${JSON.stringify(enrichReading(statements.latest.get(), { includeThresholds: true }))}\n\n`);
 
   req.on("close", () => {
     sseClients.delete(res);
@@ -1679,7 +1788,7 @@ app.get("/events", (req, res) => {
 });
 
 app.get("/api/latest", (req, res) => {
-  res.json(enrichReading(statements.latest.get()));
+  res.json(enrichReading(statements.latest.get(), { includeThresholds: true }));
 });
 
 app.get("/api/system/serial-ports", async (req, res) => {
@@ -1712,6 +1821,16 @@ app.get("/api/readings", (req, res) => {
   });
 });
 
+app.get("/api/pump/runs", (req, res) => {
+  const requestedDays = Number.parseInt(req.query.days || "30", 10);
+  const days = Number.isFinite(requestedDays) ? clamp(requestedDays, 1, 730) : 30;
+  const requestedLimit = Number.parseInt(req.query.limit || "50", 10);
+  const limit = Number.isFinite(requestedLimit) ? clamp(requestedLimit, 1, 500) : 50;
+  const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+  res.json({ days, since: sinceIso, ...getPumpRuns({ sinceIso, limit }) });
+});
+
 app.get("/api/health", (req, res) => {
   const latest = statements.latest.get();
   const alertSettings = getAlertSettings();
@@ -1720,7 +1839,7 @@ app.get("/api/health", (req, res) => {
     mode: serialState.mode,
     serial: serialState,
     database: CONFIG.dbPath,
-    latest: enrichReading(latest),
+    latest: enrichReading(latest, { includeThresholds: true }),
     thresholds: {
       maxFeet: CONFIG.maxFeet,
       lowWarningFeet: alertSettings.lowWarningFeet,
@@ -1830,7 +1949,9 @@ app.post("/api/config/ntfy/test", async (req, res) => {
 });
 
 app.get("/api/config/alerts", (req, res) => {
-  res.json(getAlertSettings());
+  // maxFeet rides along so the form can bound its inputs to the real tank
+  // height instead of the 8.0 that used to be typed into the markup.
+  res.json({ ...getAlertSettings(), maxFeet: CONFIG.maxFeet });
 });
 
 app.post("/api/config/alerts", (req, res) => {

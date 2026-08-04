@@ -18,9 +18,20 @@ function setAlertStatus(text, level = "neutral") {
 }
 
 function fillAlertForm(config) {
+  // The server clamps each of these against the tank height anyway; matching
+  // the input ceilings to it keeps the form from accepting a number that will
+  // come back silently reduced.
+  const maxFeet = Number(config.maxFeet);
+  if (Number.isFinite(maxFeet) && maxFeet > 0) {
+    alertEls.fullFeet.max = String(maxFeet);
+    alertEls.rapidLossFeet.max = String(maxFeet);
+    alertEls.lowWarningFeet.max = String(Math.round((maxFeet - 0.2) * 10) / 10);
+    alertEls.criticalFeet.max = String(Math.round((maxFeet - 0.4) * 10) / 10);
+  }
+
   alertEls.lowWarningFeet.value = config.lowWarningFeet ?? 2.0;
   alertEls.criticalFeet.value = config.criticalFeet ?? 1.0;
-  alertEls.fullFeet.value = config.fullFeet ?? 7.5;
+  alertEls.fullFeet.value = config.fullFeet ?? 7.0;
   alertEls.lowWaterAlertsEnabled.checked = Boolean(config.lowWaterAlertsEnabled);
   alertEls.rapidLossAlertsEnabled.checked = Boolean(config.rapidLossAlertsEnabled);
   alertEls.rapidLossFeet.value = config.rapidLossFeet ?? 1.0;

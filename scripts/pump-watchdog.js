@@ -15,13 +15,20 @@
 //      being dead, deadlocked, or unreachable.
 //
 //   2. Max runtime: this watchdog has been observing pumpOn=true for longer
-//      than WATCHDOG_MAX_RUNTIME_MINUTES, using its own clock - not the main
-//      app's self-reported runtime. The main app has its own max-runtime
-//      safety stop, but that logic lives in the same process that could be
-//      the thing that's broken. This is a second, independent ceiling that
-//      does not trust the main app to be telling the truth about its own
-//      state, so a logic bug that leaves the pump on all night (not just a
-//      crash) still gets caught and cut.
+//      than the operator's configured max runtime plus a grace margin, using
+//      its own clock - not the main app's self-reported runtime. The main app
+//      has its own max-runtime safety stop, but that logic lives in the same
+//      process that could be the thing that's broken. This is a second,
+//      independent ceiling that does not trust the main app to be telling the
+//      truth about its own state, so a logic bug that leaves the pump on all
+//      night (not just a crash) still gets caught and cut.
+//
+//      The limit is read from the app's status endpoint so that the two agree
+//      on the policy; only the elapsed-time measurement is independent. The
+//      alternative - a fixed limit here - meant the watchdog quietly overruled
+//      the dashboard and cut long fills short. Independence is about not
+//      trusting the app's *observations*, not about ignoring the operator's
+//      settings. A hard cap still bounds whatever the app asks for.
 //
 // On either trigger, this also tries to flip the main app's persisted pump
 // mode to manual_off (best-effort, direct SQLite write) so that if/when the
@@ -44,7 +51,25 @@ const CONFIG = {
   dbPath: process.env.DB_PATH || path.join(__dirname, "..", "water-monitor.sqlite"),
   intervalSeconds: Number.parseFloat(process.env.WATCHDOG_INTERVAL_SECONDS || "5"),
   failureThreshold: Number.parseInt(process.env.WATCHDOG_FAILURE_THRESHOLD || "3", 10),
-  maxRuntimeMinutes: Number.parseFloat(process.env.WATCHDOG_MAX_RUNTIME_MINUTES || "150"),
+  // The watchdog's runtime ceiling follows the max runtime the operator set in
+  // the app, plus a grace margin, and is capped by an absolute ceiling.
+  //
+  // It used to be a flat 150 minutes that ignored the app setting entirely, so
+  // a tank legitimately configured for a long fill got cut off at 2.5 hours
+  // with an urgent "ran too long" alert, every time. The watchdog was wrong and
+  // the app was right, but the watchdog is the one holding the relay.
+  //
+  // The grace matters: the app enforces its own limit first, and the watchdog
+  // should only fire if the app *failed* to. Without the margin both fire at
+  // the same instant and every normal timed stop races an emergency cutoff.
+  runtimeGraceMinutes: Number.parseFloat(process.env.WATCHDOG_RUNTIME_GRACE_MINUTES || "20"),
+  // Absolute cap, whatever the app asks for. The app's own setting is clamped
+  // to 24h, so 25h here means "the app's ceiling plus grace" can always be
+  // honored, while a corrupted or hostile status payload still cannot talk this
+  // watchdog out of ever cutting off.
+  hardCeilingMinutes: Number.parseFloat(process.env.WATCHDOG_MAX_RUNTIME_MINUTES || "1500"),
+  // Used only until the app has successfully reported its setting even once.
+  fallbackRuntimeMinutes: Number.parseFloat(process.env.WATCHDOG_FALLBACK_RUNTIME_MINUTES || "150"),
   // How long to wait, at watchdog startup only, for the main app to come up
   // before treating silence as a failure. systemd starts both services
   // together at boot (After= orders the start, it does not wait for the app to
@@ -67,12 +92,39 @@ const CONFIG = {
 };
 
 const USB_RELAY_OFF = Buffer.from([0xa0, 0x01, 0x00, 0xa1]);
-const MAX_RUNTIME_MS = Math.max(0.01, CONFIG.maxRuntimeMinutes) * 60 * 1000;
 
 let consecutiveFailures = 0;
 let unhealthy = false;
 let pumpOnObservedSince = null;
 let maxRuntimeTripped = false;
+// The app's configured max runtime, as last reported over HTTP. null until the
+// app has been reached and returned a usable number.
+let appMaxRuntimeMinutes = null;
+
+// Only the *limit* is learned from the app. The elapsed time it is measured
+// against is always this watchdog's own clock, so an app that lies about (or
+// loses track of) how long the pump has been running still gets caught.
+function runtimeLimitMinutes() {
+  const base = Number.isFinite(appMaxRuntimeMinutes)
+    ? appMaxRuntimeMinutes
+    : CONFIG.fallbackRuntimeMinutes;
+  return Math.min(CONFIG.hardCeilingMinutes, base + CONFIG.runtimeGraceMinutes);
+}
+
+// The status payload is untrusted input: it arrives over HTTP and is the output
+// of the very process this watchdog exists to second-guess. Anything outside
+// the range the app itself accepts is ignored in favor of the last good value.
+function adoptAppRuntimeLimit(status) {
+  const reported = Number(status?.settings?.maxRuntimeMinutes);
+  if (!Number.isFinite(reported) || reported < 1 || reported > 24 * 60) return;
+  if (reported === appMaxRuntimeMinutes) return;
+
+  const previous = appMaxRuntimeMinutes;
+  appMaxRuntimeMinutes = reported;
+  console.log(`Watchdog: adopting max runtime of ${formatDuration(reported)} from the app ` +
+    `(was ${previous === null ? `the ${formatDuration(CONFIG.fallbackRuntimeMinutes)} startup fallback` : formatDuration(previous)}). ` +
+    `Will force the relay off after ${formatDuration(runtimeLimitMinutes())} of continuous observed runtime.`);
+}
 let everReachedApp = false;
 let lastForcedOffAt = 0;
 let cutoffFailureNotified = false;
@@ -378,6 +430,7 @@ function onStatus(status) {
   consecutiveFailures = 0;
   unhealthy = false;
   everReachedApp = true;
+  adoptAppRuntimeLimit(status);
 
   if (!status.pumpOn) {
     pumpOnObservedSince = null;
@@ -391,14 +444,15 @@ function onStatus(status) {
     return;
   }
 
+  const limitMinutes = runtimeLimitMinutes();
   const observedRuntimeMs = Date.now() - pumpOnObservedSince;
-  if (observedRuntimeMs >= MAX_RUNTIME_MS) {
+  if (observedRuntimeMs >= Math.max(0.01, limitMinutes) * 60 * 1000) {
     if (!maxRuntimeTripped) {
-      console.error(`Watchdog: pump has been on for over ${CONFIG.maxRuntimeMinutes} minutes by this ` +
+      console.error(`Watchdog: pump has been on for over ${limitMinutes} minutes by this ` +
         `watchdog's own clock, regardless of what the main app reports. Forcing pump relay off.`);
       sendNtfyAlert(
         "Water pump EMERGENCY cutoff - ran too long",
-        `The backup safety system forced the pump OFF because it had been running for over ${formatDuration(CONFIG.maxRuntimeMinutes)} straight - longer than it should ever take to fill the tank.\n\n` +
+        `The backup safety system forced the pump OFF because it had been running for over ${formatDuration(limitMinutes)} straight - longer than the ${formatDuration(appMaxRuntimeMinutes ?? CONFIG.fallbackRuntimeMinutes)} limit set on the dashboard, which the monitor should have enforced on its own.\n\n` +
         "WHAT TO DO:\n" +
         "1. Go check the tank in person right away - is it full or overflowing?\n" +
         "2. If it is full, leave the pump off and check the float switch.\n" +
@@ -411,7 +465,7 @@ function onStatus(status) {
     const firstTrip = !maxRuntimeTripped;
     maxRuntimeTripped = true;
     forceRelayOff(
-      `independent max runtime of ${CONFIG.maxRuntimeMinutes} minutes exceeded`,
+      `independent max runtime of ${limitMinutes} minutes exceeded`,
       { immediate: firstTrip }
     );
   }
@@ -448,8 +502,10 @@ function onUnreachable(detail) {
 }
 
 console.log(`Pump watchdog started. Polling ${CONFIG.statusUrl} every ${CONFIG.intervalSeconds}s. ` +
-  `Forces pump off after ${CONFIG.failureThreshold} consecutive failed checks, or after ` +
-  `${CONFIG.maxRuntimeMinutes} minutes of independently observed continuous runtime, whichever comes first. ` +
+  `Forces pump off after ${CONFIG.failureThreshold} consecutive failed checks, or after the max runtime ` +
+  `set on the dashboard plus ${formatDuration(CONFIG.runtimeGraceMinutes)} of grace (hard cap ` +
+  `${formatDuration(CONFIG.hardCeilingMinutes)}), whichever comes first. Using a ` +
+  `${formatDuration(CONFIG.fallbackRuntimeMinutes)} fallback limit until the app first reports its setting. ` +
   `Allowing ${CONFIG.startupGraceSeconds}s for the main app to come up before the first check counts.`);
 
 checkStatus();

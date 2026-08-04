@@ -293,13 +293,8 @@ h2 {
   top: 8px;
 }
 
-.tank-mark.low {
-  bottom: 25%;
-}
-
-.tank-mark.critical {
-  bottom: 12.5%;
-}
+/* Vertical position is set from the live level thresholds in app.js, since it
+   depends on both the alert settings and the tank's full height. */
 
 .trend-panel canvas {
   width: 100%;
@@ -568,6 +563,36 @@ td {
   margin: 0;
   color: #d9e7ee;
   line-height: 1.5;
+}
+
+.runs-panel {
+  margin-top: 18px;
+}
+
+.runs-panel .usage-grid {
+  margin-bottom: 18px;
+}
+
+.run-flag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.run-flag.running {
+  background: rgba(84, 214, 123, 0.18);
+  color: var(--green);
+}
+
+.run-flag.unrecorded {
+  background: rgba(240, 198, 74, 0.16);
+  color: var(--yellow);
 }
 
 .usage-panel {
