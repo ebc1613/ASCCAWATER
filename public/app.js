@@ -28,7 +28,14 @@ const els = {
   pumpOnFeet: document.getElementById("pumpOnFeet"),
   pumpOffFeet: document.getElementById("pumpOffFeet"),
   pumpStaleMinutes: document.getElementById("pumpStaleMinutes"),
-  pumpMaxHours: document.getElementById("pumpMaxHours")
+  pumpMaxHours: document.getElementById("pumpMaxHours"),
+  usageSource: document.getElementById("usageSource"),
+  usage730: document.getElementById("usage730"),
+  usage365: document.getElementById("usage365"),
+  usage30: document.getElementById("usage30"),
+  usage7: document.getElementById("usage7"),
+  usageMonths: document.getElementById("usageMonths"),
+  usageNote: document.getElementById("usageNote")
 };
 
 let latestReading = null;
@@ -134,6 +141,77 @@ function renderPump(status) {
   els.pumpOffFeet.value = formatNumber(settings.autoOffFeet, 1);
   els.pumpStaleMinutes.value = Math.round(settings.staleShutdownMinutes || 60);
   els.pumpMaxHours.value = Math.round((settings.maxRuntimeMinutes || 720) / 60);
+}
+
+function formatGallons(value) {
+  if (!Number.isFinite(Number(value))) return "--";
+  const gallons = Number(value);
+  if (gallons >= 1000000) return `${(gallons / 1000000).toFixed(2)}M gal`;
+  if (gallons >= 10000) return `${Math.round(gallons / 1000).toLocaleString()}k gal`;
+  return `${Math.round(gallons).toLocaleString()} gal`;
+}
+
+function renderUsage(usage) {
+  if (!usage) return;
+
+  if (!usage.configured) {
+    els.usageSource.textContent = "Not configured";
+    els.usageSource.className = "config-status error";
+    els.usageNote.textContent = "Set the tank diameter in Settings to start estimating water usage.";
+    return;
+  }
+
+  els.usage730.textContent = formatGallons(usage.last730Days);
+  els.usage365.textContent = formatGallons(usage.last365Days);
+  els.usage30.textContent = formatGallons(usage.last30Days);
+  els.usage7.textContent = formatGallons(usage.last7Days);
+
+  const gpm = Math.round(Number(usage.pumpRateGpm) || 0);
+  const pumpLabel = {
+    estimated: `pump about ${gpm} gal/min, measured automatically`,
+    manual: `pump ${gpm} gal/min`,
+    "manual-fallback": `pump ${gpm} gal/min`,
+    unset: "pump rate unknown"
+  }[usage.pumpRateSource] || "pump rate unknown";
+
+  els.usageSource.textContent = `${usage.daysRecorded} days recorded`;
+  els.usageSource.className = "config-status ok";
+
+  const coverageNote = usage.coveragePercent < 90
+    ? ` Sensor data covers only ${usage.coveragePercent}% of that span, so the real total is likely higher.`
+    : "";
+  const pumpNote = usage.pumpRateSource === "unset"
+    ? " Water used while the pump was filling is not counted yet, so this reads low - set a pump rate in Settings."
+    : "";
+
+  els.usageNote.textContent =
+    `Rough estimate from tank level change plus pump run time (${Math.round(usage.gallonsPerFoot).toLocaleString()} gal per foot, ${pumpLabel}). ` +
+    `Not a metered figure.${pumpNote}${coverageNote}`;
+
+  renderUsageMonths(usage.monthly || []);
+}
+
+function renderUsageMonths(monthly) {
+  if (!monthly.length) {
+    els.usageMonths.innerHTML = "";
+    return;
+  }
+
+  const recent = monthly.slice(-24);
+  const peak = Math.max(...recent.map((entry) => entry.gallons), 1);
+
+  els.usageMonths.innerHTML = recent.map((entry) => {
+    const height = Math.max(2, Math.round((entry.gallons / peak) * 100));
+    const [year, month] = entry.month.split("-");
+    const label = new Intl.DateTimeFormat(undefined, { month: "short" })
+      .format(new Date(Number(year), Number(month) - 1, 1));
+    return `
+      <div class="usage-month" title="${entry.month}: ${Math.round(entry.gallons).toLocaleString()} gal">
+        <div class="usage-bar-track"><div class="usage-bar" style="height:${height}%"></div></div>
+        <span>${label}</span>
+      </div>
+    `;
+  }).join("");
 }
 
 function renderTable() {
@@ -256,6 +334,16 @@ async function loadTrend() {
   drawTrend();
 }
 
+async function loadUsage() {
+  try {
+    renderUsage(await (await fetch("/api/usage")).json());
+  } catch (error) {
+    // Usage is a summary figure, not a safety-critical reading. A failure
+    // here must not take down the rest of the dashboard load.
+    console.error("Could not load usage summary", error);
+  }
+}
+
 async function loadData() {
   const [latestRes, readingsRes, pumpRes] = await Promise.all([
     fetch("/api/latest"),
@@ -268,6 +356,7 @@ async function loadData() {
   renderPump(await pumpRes.json());
   renderTable();
   await loadTrend();
+  await loadUsage();
 }
 
 function connectEvents() {
@@ -346,6 +435,9 @@ els.pumpSettingsForm.addEventListener("submit", async (event) => {
   }
 });
 window.addEventListener("resize", drawTrend);
+// The rollup only recomputes hourly on the server, so polling faster than
+// this would just re-fetch an identical answer.
+setInterval(loadUsage, 15 * 60 * 1000);
 setInterval(() => {
   if (!latestReading) return;
   latestReading.communication = {

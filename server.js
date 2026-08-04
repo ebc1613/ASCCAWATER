@@ -92,6 +92,11 @@ const CONFIG = {
     usbRelayVendorId: process.env.PUMP_USB_RELAY_VENDOR_ID || "",
     usbRelayProductId: process.env.PUMP_USB_RELAY_PRODUCT_ID || ""
   },
+  usage: {
+    tankDiameterFeet: Number.parseFloat(process.env.TANK_DIAMETER_FEET || "0"),
+    gallonsPerFoot: Number.parseFloat(process.env.TANK_GALLONS_PER_FOOT || "0"),
+    pumpRateGpm: Number.parseFloat(process.env.PUMP_RATE_GPM || "0")
+  },
   ntfy: {
     enabled: String(process.env.NTFY_ENABLED || "").toLowerCase() === "true",
     serverUrl: process.env.NTFY_SERVER_URL || "",
@@ -110,6 +115,21 @@ db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
 db.exec(fs.readFileSync(path.join(__dirname, "db", "schema.sql"), "utf8"));
+
+// CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+// columns added to schema.sql after a database was first created have to be
+// applied explicitly. Adding a nullable column is cheap and non-destructive.
+function ensureColumn(table, column, definition) {
+  const existing = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (existing.some((info) => info.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  console.log(`Added ${table}.${column} column.`);
+}
+
+ensureColumn("daily_usage", "drop_feet", "REAL");
+ensureColumn("daily_usage", "pump_minutes", "REAL");
+ensureColumn("daily_usage", "gallons_per_foot", "REAL");
+ensureColumn("daily_usage", "covered_minutes", "REAL");
 
 const statements = {
   insertReading: db.prepare(`
@@ -184,18 +204,39 @@ const statements = {
     LIMIT 1
   `),
   upsertDailyUsage: db.prepare(`
-    INSERT INTO daily_usage (day, gallons, pump_rate, computed_at)
-    VALUES (@day, @gallons, @pump_rate, @computed_at)
+    INSERT INTO daily_usage (
+      day, gallons, pump_rate, computed_at,
+      drop_feet, pump_minutes, gallons_per_foot, covered_minutes
+    )
+    VALUES (
+      @day, @gallons, @pump_rate, @computed_at,
+      @drop_feet, @pump_minutes, @gallons_per_foot, @covered_minutes
+    )
     ON CONFLICT(day) DO UPDATE SET
       gallons = excluded.gallons,
       pump_rate = excluded.pump_rate,
-      computed_at = excluded.computed_at
+      computed_at = excluded.computed_at,
+      drop_feet = excluded.drop_feet,
+      pump_minutes = excluded.pump_minutes,
+      gallons_per_foot = excluded.gallons_per_foot,
+      covered_minutes = excluded.covered_minutes
   `),
   dailyUsageRange: db.prepare(`
-    SELECT day, gallons
+    SELECT day, gallons, pump_rate, drop_feet, pump_minutes, gallons_per_foot, covered_minutes
     FROM daily_usage
     WHERE day >= ? AND day <= ?
     ORDER BY day ASC
+  `),
+  dailyUsageDays: db.prepare(`
+    SELECT day FROM daily_usage WHERE day >= ? AND day <= ?
+  `),
+  rescaleDailyUsage: db.prepare(`
+    UPDATE daily_usage
+    SET gallons = @gallons,
+        pump_rate = @pump_rate,
+        gallons_per_foot = @gallons_per_foot,
+        computed_at = @computed_at
+    WHERE day = @day
   `)
 };
 
@@ -242,6 +283,16 @@ const DEFAULT_PUMP_OUTPUT_SETTINGS = {
 // checksum (sum of the first three bytes).
 const USB_RELAY_ON = Buffer.from([0xa0, 0x01, 0x01, 0xa2]);
 const USB_RELAY_OFF = Buffer.from([0xa0, 0x01, 0x00, 0xa1]);
+const USB_RELAY_RETRY_MS = 10000;
+
+// The pump output is opened asynchronously (USB relay enumeration is not
+// instant), so for the first moments after a start or a hot re-init the
+// output legitimately reads as unavailable. Without this grace window every
+// single app restart fired a high-priority "relay problem" push followed a
+// second later by "relay reconnected" - which trains people to ignore the one
+// alert that actually matters.
+const PUMP_FAULT_ALERT_GRACE_MS = 60 * 1000;
+let pumpOutputReadyDeadline = Date.now() + PUMP_FAULT_ALERT_GRACE_MS;
 
 const DEFAULT_NTFY_SETTINGS = {
   enabled: CONFIG.ntfy.enabled,
@@ -260,6 +311,53 @@ const DEFAULT_ALERT_SETTINGS = {
   rapidLossMinutes: 30
 };
 
+// --- Water usage estimation -------------------------------------------------
+//
+// This is deliberately an estimate, not metering. There is no flow meter on
+// this system; the only thing we observe is tank level every 5 minutes. Water
+// leaving the tank shows up as the level falling, so usage is reconstructed
+// from level drops, plus whatever the pump put in while the level was being
+// held up or refilled.
+//
+// Two things dominate the error, and both are handled below:
+//
+//   1. Sensor noise. Naively summing every 5-minute drop would rectify noise
+//      into fake consumption - at +/-0.05 ft of jitter that is several
+//      thousand gallons a day of pure noise on a tank this size. Readings are
+//      therefore collapsed into hourly buckets by median (12 samples/bucket,
+//      which cuts the jitter roughly threefold) and changes smaller than a
+//      deadband are treated as zero.
+//   2. Usage that happens while the pump is running is invisible in the level
+//      alone, because inflow masks it. Pump-on minutes multiplied by the pump
+//      rate add that back.
+const GALLONS_PER_CUBIC_FOOT = 7.48052;
+const USAGE_BUCKET_MS = 60 * 60 * 1000;
+const USAGE_DEADBAND_FEET = 0.03;
+const USAGE_MAX_GAP_MINUTES = 360;
+const USAGE_ROLLING_DAYS = 730;
+// Days always recomputed from raw readings on each refresh, so late-arriving
+// data and the still-in-progress current day stay correct.
+const USAGE_RECOMPUTE_DAYS = 3;
+const USAGE_PUMP_RATE_WINDOW_DAYS = 30;
+const USAGE_PUMP_RATE_BUCKET_MS = 15 * 60 * 1000;
+
+const DEFAULT_USAGE_SETTINGS = {
+  // Only the tank's inside diameter matters here, not its height or where the
+  // sensor is tapped: usage is derived from *changes* in level, so the 1 ft
+  // offset between this sensor and the tank's physical gauge cancels out.
+  tankDiameterFeet: CONFIG.usage.tankDiameterFeet > 0 ? CONFIG.usage.tankDiameterFeet : 33,
+  gallonsPerFootOverride: CONFIG.usage.gallonsPerFoot > 0 ? CONFIG.usage.gallonsPerFoot : 0,
+  pumpRateGpm: CONFIG.usage.pumpRateGpm > 0 ? CONFIG.usage.pumpRateGpm : 0,
+  autoPumpRate: true
+};
+
+const usageState = {
+  gallonsPerFoot: 0,
+  pumpRateGpm: 0,
+  pumpRateSource: "unknown",
+  lastComputedAt: null
+};
+
 const alertState = {
   lastAlarmLevel: null,
   rapidLossArmed: true
@@ -273,6 +371,12 @@ const pumpAlertState = {
   staleNotified: false
 };
 
+// Bumped on every (re)initialization of the pump output. Any async retry loop
+// left over from a previous output captures the value at its creation and
+// stops touching shared state once it no longer matches - otherwise a
+// hot-swap of output hardware leaves an orphaned reconnect loop racing the new
+// one and clobbering pumpState with faults from hardware we no longer use.
+let pumpOutputGeneration = 0;
 let pumpOutput = null;
 let pumpState = {
   enabled: CONFIG.pump.enabled,
@@ -680,24 +784,59 @@ function sanitizePumpSettings(input) {
   return settings;
 }
 
-function initPumpOutput() {
-  if (!CONFIG.pump.enabled) {
-    pumpState.reason = "Pump output disabled. Set PUMP_CONTROL_ENABLED=true after wiring is ready.";
-    return;
-  }
+// Releases whatever output hardware is currently held, driving it OFF on the
+// way out, and invalidates any in-flight reconnect loop. Safe to call when no
+// output is open. This is what makes an output change applyable in place: the
+// old GPIO export or serial connection is fully released before the new one is
+// opened, which is the same ordering a process restart gave us before.
+function teardownPumpOutput() {
+  pumpOutputGeneration += 1;
+  const previous = pumpOutput;
+  pumpOutput = null;
+  pumpState.output.available = false;
 
+  if (!previous) return;
+
+  try {
+    if (previous.kind === "gpio") {
+      previous.gpio.writeSync(previous.activeHigh ? 0 : 1);
+      previous.gpio.unexport();
+    } else if (previous.kind === "usb_relay") {
+      if (previous.retryTimer) clearTimeout(previous.retryTimer);
+      if (previous.port?.isOpen) {
+        previous.port.write(USB_RELAY_OFF);
+        previous.port.close();
+      }
+    }
+  } catch (error) {
+    console.warn(`Releasing previous pump output failed: ${error.message}`);
+  }
+}
+
+// Note that this runs even when PUMP_CONTROL_ENABLED is false. Opening the
+// output only ever drives it OFF, so doing it unconditionally is strictly
+// safer than leaving the hardware untouched - and it means the Settings page
+// can tell you whether the relay is actually plugged in and talking *before*
+// you commit to enabling control. Energizing is still gated on
+// CONFIG.pump.enabled in evaluatePumpControl().
+function initPumpOutput() {
+  teardownPumpOutput();
+
+  const generation = pumpOutputGeneration;
   const settings = getPumpOutputSettings();
   pumpState.output.type = settings.type;
+  pumpState.fault = null;
+  pumpOutputReadyDeadline = Date.now() + PUMP_FAULT_ALERT_GRACE_MS;
 
   if (settings.type === "usb_relay") {
-    initUsbRelayOutput(settings);
+    initUsbRelayOutput(generation);
     return;
   }
 
   try {
     const { Gpio } = require("onoff");
     const gpio = new Gpio(settings.gpioPin, "out");
-    pumpOutput = { kind: "gpio", gpio, activeHigh: settings.gpioActiveHigh };
+    pumpOutput = { kind: "gpio", gpio, activeHigh: settings.gpioActiveHigh, generation };
     pumpState.output.available = true;
     writePumpOutput(false);
     pumpState.reason = `GPIO output on pin ${settings.gpioPin} initialized off.`;
@@ -717,8 +856,15 @@ async function resolveUsbRelayPath(settings) {
   // programmed, so the OS cannot keep their /dev path stable across a
   // disconnect/reconnect - each reconnect can get renumbered. Vendor and
   // product ID survive that renumbering, so prefer matching on those over
-  // trusting a fixed path. usbRelayPort is kept only as a fallback for when
-  // no match is found (e.g. unplugged) or when VID/PID are not set.
+  // trusting a fixed path.
+  //
+  // When VID/PID are set and nothing matches, this deliberately returns null
+  // rather than falling back to usbRelayPort. The saved path is only a
+  // fallback for when identity matching is not configured at all. Once you
+  // have told us what the relay *is*, a no-match means the relay is not
+  // present - and /dev/ttyUSB1 may well have been renumbered to the water
+  // level sensor by then. Sending relay commands to the sensor's port is a
+  // worse failure than reporting the relay as missing.
   try {
     const ports = await SerialPort.list();
     const match = ports.find((candidate) =>
@@ -731,64 +877,118 @@ async function resolveUsbRelayPath(settings) {
   }
 }
 
-function initUsbRelayOutput(settings) {
-  const byIdentity = Boolean(settings.usbRelayVendorId && settings.usbRelayProductId);
-  if (!settings.usbRelayPort && !byIdentity) {
-    pumpState.fault = "USB relay port is not configured.";
-    pumpState.reason = "No USB relay port set; pump held off.";
-    return;
-  }
+function initUsbRelayOutput(generation) {
+  const output = {
+    kind: "usb_relay",
+    port: null,
+    path: null,
+    retryTimer: null,
+    connecting: false,
+    generation
+  };
+  pumpOutput = output;
 
-  pumpOutput = { kind: "usb_relay", port: null };
+  // Two invariants this loop holds that the previous version did not:
+  //
+  //   - At most one retry is pending and at most one open() is in flight, so
+  //     a reconnect can never fan out into overlapping attempts against the
+  //     same device. Previously a retry could be scheduled from the open()
+  //     callback and from the port's "close" event, and each attempt created
+  //     a fresh SerialPort while the discarded one kept its listeners.
+  //   - It stops touching shared state as soon as it is no longer the current
+  //     output. That is a hard requirement now that settings can be applied
+  //     without restarting: without it, a loop still hunting for the old
+  //     device would keep overwriting pumpState.fault with stale failures
+  //     about hardware the operator already moved away from.
+  const isCurrent = () => pumpOutput === output && pumpOutputGeneration === generation;
 
-  const reopen = async () => {
-    if (pumpOutput.port?.isOpen) return;
+  const scheduleReopen = () => {
+    if (!isCurrent() || output.retryTimer) return;
+    output.retryTimer = setTimeout(() => {
+      output.retryTimer = null;
+      reopen();
+    }, USB_RELAY_RETRY_MS);
+    output.retryTimer.unref?.();
+  };
 
-    const path = await resolveUsbRelayPath(settings);
-    if (!path) {
-      pumpState.output.available = false;
-      pumpState.fault = byIdentity
-        ? `No USB relay matching ${settings.usbRelayVendorId}:${settings.usbRelayProductId} found.`
-        : "USB relay port is not configured.";
-      console.warn(pumpState.fault);
-      setTimeout(reopen, 10000);
-      return;
-    }
-
-    const port = new SerialPort({ path, baudRate: settings.usbRelayBaud, autoOpen: false });
-    pumpOutput.port = port;
+  const openPort = (path, baudRate) => new Promise((resolve, reject) => {
+    const port = new SerialPort({ path, baudRate, autoOpen: false });
+    output.port = port;
+    output.path = path;
 
     port.on("open", () => {
+      if (!isCurrent()) return;
       pumpState.output.available = true;
       pumpState.fault = null;
       pumpState.reason = `USB relay on ${path} initialized off.`;
-      console.log(`Pump USB relay connected at ${path} (${settings.usbRelayBaud} baud)`);
+      console.log(`Pump USB relay connected at ${path} (${baudRate} baud)`);
       writePumpOutput(false);
     });
 
     port.on("error", (error) => {
+      if (!isCurrent()) return;
       pumpState.output.available = false;
       pumpState.fault = `USB relay error: ${error.message}`;
       console.error(pumpState.fault);
     });
 
     port.on("close", () => {
+      if (!isCurrent()) return;
       pumpState.output.available = false;
       pumpState.fault = "USB relay port closed.";
       pumpState.output.dropCount += 1;
       pumpState.output.lastDropAt = new Date().toISOString();
-      console.warn(`Pump USB relay port closed (drop #${pumpState.output.dropCount}); retrying in 10 seconds.`);
-      setTimeout(reopen, 10000);
+      console.warn(`Pump USB relay port closed (drop #${pumpState.output.dropCount}); ` +
+        `retrying in ${Math.round(USB_RELAY_RETRY_MS / 1000)} seconds.`);
+      scheduleReopen();
     });
 
-    port.open((error) => {
-      if (error) {
+    port.open((error) => (error ? reject(error) : resolve()));
+  });
+
+  const reopen = async () => {
+    if (!isCurrent() || output.connecting || output.port?.isOpen) return;
+    output.connecting = true;
+
+    try {
+      // Re-read settings on every attempt instead of closing over the values
+      // captured at init. A retry loop that keeps hunting for the device you
+      // configured ten minutes ago is exactly the "it only works after a
+      // restart" behavior we are trying to remove.
+      const settings = getPumpOutputSettings();
+      if (settings.type !== "usb_relay") return;
+
+      const byIdentity = Boolean(settings.usbRelayVendorId && settings.usbRelayProductId);
+      if (!settings.usbRelayPort && !byIdentity) {
         pumpState.output.available = false;
-        pumpState.fault = `USB relay unavailable: ${error.message}`;
-        console.warn(pumpState.fault);
-        setTimeout(reopen, 10000);
+        pumpState.fault = "USB relay port is not configured.";
+        pumpState.reason = "No USB relay port set; pump held off.";
+        return;
       }
-    });
+
+      const path = await resolveUsbRelayPath(settings);
+      if (!isCurrent()) return;
+
+      if (!path) {
+        pumpState.output.available = false;
+        pumpState.fault = byIdentity
+          ? `No USB relay matching ${settings.usbRelayVendorId}:${settings.usbRelayProductId} found.`
+          : "USB relay port is not configured.";
+        console.warn(pumpState.fault);
+        scheduleReopen();
+        return;
+      }
+
+      await openPort(path, settings.usbRelayBaud);
+    } catch (error) {
+      if (!isCurrent()) return;
+      pumpState.output.available = false;
+      pumpState.fault = `USB relay unavailable: ${error.message}`;
+      console.warn(pumpState.fault);
+      scheduleReopen();
+    } finally {
+      output.connecting = false;
+    }
   };
 
   reopen();
@@ -925,7 +1125,7 @@ function evaluatePumpControl() {
 
   if (pumpState.fault || !pumpState.output.available) {
     setPumpOn(false, pumpState.fault || "Pump output unavailable; pump held off.", latest);
-    if (!pumpAlertState.faultNotified) {
+    if (!pumpAlertState.faultNotified && Date.now() >= pumpOutputReadyDeadline) {
       pumpAlertState.faultNotified = true;
       sendPumpAlert(
         "Water pump: relay problem - pump held off",
@@ -1007,6 +1207,352 @@ function getPumpStatus() {
     runtimeSeconds,
     settings,
     latest: enrichReading(latest)
+  };
+}
+
+function getUsageSettings() {
+  return sanitizeUsageSettings(getStoredJsonSetting("usage", DEFAULT_USAGE_SETTINGS));
+}
+
+function sanitizeUsageSettings(input) {
+  const tankDiameterFeet = round(clamp(Number(input.tankDiameterFeet), 0, 500), 2);
+  const gallonsPerFootOverride = round(clamp(Number(input.gallonsPerFootOverride), 0, 1000000), 2);
+  const pumpRateGpm = round(clamp(Number(input.pumpRateGpm), 0, 10000), 2);
+
+  return {
+    tankDiameterFeet: Number.isFinite(tankDiameterFeet) ? tankDiameterFeet : DEFAULT_USAGE_SETTINGS.tankDiameterFeet,
+    gallonsPerFootOverride: Number.isFinite(gallonsPerFootOverride) ? gallonsPerFootOverride : 0,
+    pumpRateGpm: Number.isFinite(pumpRateGpm) ? pumpRateGpm : 0,
+    autoPumpRate: Boolean(input.autoPumpRate)
+  };
+}
+
+function resolveGallonsPerFoot(settings) {
+  if (settings.gallonsPerFootOverride > 0) return settings.gallonsPerFootOverride;
+  if (!(settings.tankDiameterFeet > 0)) return 0;
+  const radius = settings.tankDiameterFeet / 2;
+  return Math.PI * radius * radius * GALLONS_PER_CUBIC_FOOT;
+}
+
+function localDayKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function localDayStart(dayKey) {
+  const [year, month, day] = dayKey.split("-").map(Number);
+  return new Date(year, month - 1, day, 0, 0, 0, 0);
+}
+
+function addDays(dayKey, delta) {
+  const date = localDayStart(dayKey);
+  date.setDate(date.getDate() + delta);
+  return localDayKey(date);
+}
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+}
+
+function percentile(values, fraction) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = clamp(Math.round((sorted.length - 1) * fraction), 0, sorted.length - 1);
+  return sorted[index];
+}
+
+// Collapses raw readings into one representative sample per time bucket:
+// median level (noise rejection) at the mean timestamp of the bucket.
+function bucketReadings(rows, originMs, bucketMs) {
+  const buckets = new Map();
+
+  for (const row of rows) {
+    const time = new Date(row.timestamp).getTime();
+    if (!Number.isFinite(time) || !Number.isFinite(row.feet)) continue;
+    const index = Math.floor((time - originMs) / bucketMs);
+    if (!buckets.has(index)) buckets.set(index, { times: [], feet: [] });
+    const bucket = buckets.get(index);
+    bucket.times.push(time);
+    bucket.feet.push(row.feet);
+  }
+
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, bucket]) => ({
+      t: bucket.times.reduce((sum, value) => sum + value, 0) / bucket.times.length,
+      feet: median(bucket.feet)
+    }));
+}
+
+// Minutes the pump was energized between two instants, reconstructed from the
+// pump_events timeline. pump_events is never pruned, so this stays accurate
+// for days whose readings are long gone.
+function pumpOnMinutesBetween(fromMs, toMs) {
+  const fromIso = new Date(fromMs).toISOString();
+  const toIso = new Date(toMs).toISOString();
+
+  let on = statements.lastPumpStateBefore.get(fromIso)?.pump_on === 1;
+  let cursor = fromMs;
+  let onMs = 0;
+
+  for (const event of statements.pumpEventsBetween.all(fromIso, toIso)) {
+    const time = new Date(event.timestamp).getTime();
+    if (!Number.isFinite(time)) continue;
+    const clamped = clamp(time, fromMs, toMs);
+    if (on) onMs += clamped - cursor;
+    cursor = clamped;
+    on = event.pump_on === 1;
+  }
+
+  if (on) onMs += toMs - cursor;
+  return onMs / 60000;
+}
+
+// Infers the pump's delivery rate from how fast the tank actually rose during
+// intervals when the pump ran the whole time.
+//
+// A net rise always *understates* the pump, because the camp is usually still
+// drawing water while the tank fills. The fastest observed fills are the ones
+// with the least draw against them, so the high end of the distribution is the
+// closest approximation to what the pump really puts out. The 90th percentile
+// rather than the maximum keeps one noisy bucket from setting the number.
+function estimatePumpRateGpm(gallonsPerFoot) {
+  const since = new Date(Date.now() - USAGE_PUMP_RATE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  const rows = statements.trendRange.all(since.toISOString());
+  if (rows.length < 8) return 0;
+
+  const samples = bucketReadings(rows, since.getTime(), USAGE_PUMP_RATE_BUCKET_MS);
+  const rates = [];
+
+  for (let i = 1; i < samples.length; i += 1) {
+    const previous = samples[i - 1];
+    const current = samples[i];
+    const gapMinutes = (current.t - previous.t) / 60000;
+    if (!(gapMinutes > 0) || gapMinutes > USAGE_MAX_GAP_MINUTES) continue;
+
+    // Require the pump to have been on for essentially the whole interval,
+    // otherwise part of the rise happened with the pump off and the rate comes
+    // out too low.
+    const pumpMinutes = pumpOnMinutesBetween(previous.t, current.t);
+    if (pumpMinutes < gapMinutes * 0.98) continue;
+
+    const riseFeet = current.feet - previous.feet;
+    if (riseFeet <= USAGE_DEADBAND_FEET) continue;
+
+    rates.push((riseFeet * gallonsPerFoot) / gapMinutes);
+  }
+
+  if (rates.length < 5) return 0;
+  return round(percentile(rates, 0.9), 2);
+}
+
+function resolvePumpRateGpm(settings, gallonsPerFoot) {
+  if (!settings.autoPumpRate) {
+    usageState.pumpRateSource = settings.pumpRateGpm > 0 ? "manual" : "unset";
+    return settings.pumpRateGpm;
+  }
+
+  const estimated = estimatePumpRateGpm(gallonsPerFoot);
+  if (estimated > 0) {
+    usageState.pumpRateSource = "estimated";
+    return estimated;
+  }
+
+  usageState.pumpRateSource = settings.pumpRateGpm > 0 ? "manual-fallback" : "unset";
+  return settings.pumpRateGpm;
+}
+
+// Estimated gallons consumed during one local calendar day. Returns null when
+// there is nothing to compute from, which deliberately leaves any previously
+// stored row for that day untouched - so pruning old readings can never erase
+// or shrink usage history that was already rolled up.
+function computeUsageForDay(dayKey, context) {
+  const startMs = localDayStart(dayKey).getTime();
+  const endMs = Math.min(localDayStart(addDays(dayKey, 1)).getTime(), Date.now());
+  if (endMs <= startMs) return null;
+
+  const rows = statements.readingsBetween.all(
+    new Date(startMs).toISOString(),
+    new Date(endMs).toISOString()
+  );
+  if (!rows.length) return null;
+
+  const samples = bucketReadings(rows, startMs, USAGE_BUCKET_MS);
+
+  // Seed with the last reading at or before midnight so water used during the
+  // first hour is attributed instead of dropped.
+  const baseline = statements.readingAtOrBefore.get(new Date(startMs).toISOString());
+  if (baseline) {
+    const baselineMs = new Date(baseline.timestamp).getTime();
+    if (Number.isFinite(baselineMs) && startMs - baselineMs <= USAGE_MAX_GAP_MINUTES * 60000) {
+      samples.unshift({ t: baselineMs, feet: baseline.feet });
+    }
+  }
+
+  if (samples.length < 2) return null;
+
+  let gallons = 0;
+  let dropFeet = 0;
+  let pumpMinutes = 0;
+  let coveredMinutes = 0;
+
+  for (let i = 1; i < samples.length; i += 1) {
+    const previous = samples[i - 1];
+    const current = samples[i];
+    const gapMinutes = (current.t - previous.t) / 60000;
+    if (!(gapMinutes > 0) || gapMinutes > USAGE_MAX_GAP_MINUTES) continue;
+
+    let intervalDrop = previous.feet - current.feet;
+    if (Math.abs(intervalDrop) < USAGE_DEADBAND_FEET) intervalDrop = 0;
+
+    // Recorded even when no pump rate is known yet. It costs one extra lookup
+    // and it means that once a rate does become available, days whose raw
+    // readings have since been pruned can still be repriced from stored
+    // inputs instead of being stuck at their rate-less estimate forever.
+    const intervalPumpMinutes = pumpOnMinutesBetween(previous.t, current.t);
+
+    const intervalGallons = intervalDrop * context.gallonsPerFoot
+      + intervalPumpMinutes * context.pumpRateGpm;
+
+    // Clamped per interval: a rising tank with the pump off means water was
+    // added by some other means (or the sensor moved), not negative usage.
+    gallons += Math.max(0, intervalGallons);
+    dropFeet += intervalDrop;
+    pumpMinutes += intervalPumpMinutes;
+    coveredMinutes += gapMinutes;
+  }
+
+  return {
+    day: dayKey,
+    gallons: round(gallons, 1),
+    drop_feet: round(dropFeet, 4),
+    pump_minutes: round(pumpMinutes, 2),
+    pump_rate: context.pumpRateGpm,
+    gallons_per_foot: round(context.gallonsPerFoot, 4),
+    covered_minutes: round(coveredMinutes, 1),
+    computed_at: new Date().toISOString()
+  };
+}
+
+const writeDailyUsageRows = db.transaction((rows) => {
+  for (const row of rows) statements.upsertDailyUsage.run(row);
+});
+
+const rescaleDailyUsageRows = db.transaction((rows) => {
+  for (const row of rows) statements.rescaleDailyUsage.run(row);
+});
+
+// Reprices already-rolled-up days that we can no longer recompute from raw
+// readings (they were pruned). Uses the stored drop/pump-minute inputs, so
+// correcting the tank diameter or pump rate later fixes the whole two-year
+// history instead of leaving a discontinuity at the retention boundary.
+function rescaleStoredUsage(gallonsPerFoot, pumpRateGpm) {
+  const todayKey = localDayKey(new Date());
+  const rows = statements.dailyUsageRange.all(addDays(todayKey, -USAGE_ROLLING_DAYS), todayKey);
+  const computedAt = new Date().toISOString();
+
+  const updates = rows
+    .filter((row) => Number.isFinite(row.drop_feet)
+      && Math.abs((row.gallons_per_foot ?? 0) - gallonsPerFoot) > 1e-6)
+    .map((row) => ({
+      day: row.day,
+      gallons: round(Math.max(0, row.drop_feet * gallonsPerFoot + (row.pump_minutes || 0) * pumpRateGpm), 1),
+      pump_rate: pumpRateGpm,
+      gallons_per_foot: round(gallonsPerFoot, 4),
+      computed_at: computedAt
+    }));
+
+  if (updates.length) {
+    rescaleDailyUsageRows(updates);
+    console.log(`Repriced ${updates.length} days of usage history at ${round(gallonsPerFoot, 1)} gal/ft.`);
+  }
+  return updates.length;
+}
+
+function refreshDailyUsage(options = {}) {
+  const settings = getUsageSettings();
+  const gallonsPerFoot = resolveGallonsPerFoot(settings);
+
+  usageState.gallonsPerFoot = gallonsPerFoot;
+  if (!(gallonsPerFoot > 0)) {
+    usageState.pumpRateSource = "unset";
+    return;
+  }
+
+  const pumpRateGpm = resolvePumpRateGpm(settings, gallonsPerFoot);
+  usageState.pumpRateGpm = pumpRateGpm;
+
+  if (options.rescale) rescaleStoredUsage(gallonsPerFoot, pumpRateGpm);
+
+  const first = statements.firstReadingTime.get();
+  if (!first) return;
+
+  const todayKey = localDayKey(new Date());
+  const earliestKey = addDays(todayKey, -USAGE_ROLLING_DAYS);
+  let cursor = localDayKey(new Date(first.timestamp));
+  if (cursor < earliestKey) cursor = earliestKey;
+
+  const known = new Set(statements.dailyUsageDays.all(cursor, todayKey).map((row) => row.day));
+  const alwaysRecomputeFrom = addDays(todayKey, -(USAGE_RECOMPUTE_DAYS - 1));
+  const context = { gallonsPerFoot, pumpRateGpm };
+  const writes = [];
+
+  for (let day = cursor; day <= todayKey; day = addDays(day, 1)) {
+    const stale = options.full || !known.has(day) || day >= alwaysRecomputeFrom;
+    if (!stale) continue;
+    const computed = computeUsageForDay(day, context);
+    if (computed) writes.push(computed);
+  }
+
+  if (writes.length) writeDailyUsageRows(writes);
+  usageState.lastComputedAt = new Date().toISOString();
+}
+
+function summarizeUsage() {
+  const settings = getUsageSettings();
+  const gallonsPerFoot = resolveGallonsPerFoot(settings);
+  const todayKey = localDayKey(new Date());
+  const rows = statements.dailyUsageRange.all(addDays(todayKey, -(USAGE_ROLLING_DAYS - 1)), todayKey);
+
+  const totalSince = (days) => {
+    const from = addDays(todayKey, -(days - 1));
+    return round(rows.reduce((sum, row) => (row.day >= from ? sum + row.gallons : sum), 0), 0);
+  };
+
+  const monthly = new Map();
+  for (const row of rows) {
+    const month = row.day.slice(0, 7);
+    monthly.set(month, round((monthly.get(month) || 0) + row.gallons, 0));
+  }
+
+  const coveredMinutes = rows.reduce((sum, row) => sum + (row.covered_minutes || 0), 0);
+  const spanDays = rows.length ? Math.max(1, rows.length) : 0;
+
+  return {
+    configured: gallonsPerFoot > 0,
+    gallonsPerFoot: round(gallonsPerFoot, 1),
+    tankDiameterFeet: settings.tankDiameterFeet,
+    pumpRateGpm: usageState.pumpRateGpm,
+    pumpRateSource: usageState.pumpRateSource,
+    lastComputedAt: usageState.lastComputedAt,
+    rollingDays: USAGE_ROLLING_DAYS,
+    firstDay: rows.length ? rows[0].day : null,
+    lastDay: rows.length ? rows[rows.length - 1].day : null,
+    daysRecorded: rows.length,
+    // What fraction of the recorded span the sensor was actually reporting
+    // for. A two-year total built from patchy data should say so rather than
+    // quietly reading low.
+    coveragePercent: spanDays ? round(clamp((coveredMinutes / (spanDays * 1440)) * 100, 0, 100), 1) : 0,
+    today: totalSince(1),
+    last7Days: totalSince(7),
+    last30Days: totalSince(30),
+    last365Days: totalSince(365),
+    last730Days: totalSince(730),
+    monthly: [...monthly.entries()].map(([month, gallons]) => ({ month, gallons })),
+    daily: rows.map((row) => ({ day: row.day, gallons: row.gallons }))
   };
 }
 
@@ -1200,6 +1746,45 @@ app.get("/api/trend", (req, res) => {
   });
 });
 
+app.get("/api/usage", (req, res) => {
+  res.json(summarizeUsage());
+});
+
+app.get("/api/config/usage", (req, res) => {
+  const settings = getUsageSettings();
+  res.json({
+    ...settings,
+    gallonsPerFoot: round(resolveGallonsPerFoot(settings), 1),
+    effectivePumpRateGpm: usageState.pumpRateGpm,
+    pumpRateSource: usageState.pumpRateSource
+  });
+});
+
+app.post("/api/config/usage", (req, res) => {
+  if (req.body?.confirm !== true) {
+    res.status(400).json({ error: "Usage settings changes require confirm=true." });
+    return;
+  }
+
+  try {
+    const next = sanitizeUsageSettings(req.body);
+    saveStoredJsonSetting("usage", next);
+    // Reprice the stored history and recompute everything we still have
+    // readings for, so the change applies to the whole two-year window rather
+    // than only to days from here forward.
+    refreshDailyUsage({ full: true, rescale: true });
+    res.json({
+      ...next,
+      gallonsPerFoot: round(resolveGallonsPerFoot(next), 1),
+      effectivePumpRateGpm: usageState.pumpRateGpm,
+      pumpRateSource: usageState.pumpRateSource,
+      usage: summarizeUsage()
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.get("/api/pump/status", (req, res) => {
   evaluatePumpControl();
   res.json(getPumpStatus());
@@ -1263,24 +1848,75 @@ app.post("/api/config/alerts", (req, res) => {
   }
 });
 
+// Live view of what the output hardware is actually doing right now, so the
+// Settings page can answer "is the relay plugged in and talking?" without
+// anyone having to read logs or restart anything.
+function getPumpOutputStatus() {
+  return {
+    controlEnabled: CONFIG.pump.enabled,
+    type: pumpState.output.type,
+    available: pumpState.output.available,
+    fault: pumpState.fault,
+    connectedPath: pumpOutput?.kind === "usb_relay" && pumpOutput.port?.isOpen ? pumpOutput.path : null,
+    dropCount: pumpState.output.dropCount,
+    lastDropAt: pumpState.output.lastDropAt
+  };
+}
+
 app.get("/api/config/pump-output", (req, res) => {
-  res.json({ ...getPumpOutputSettings(), recommendation: PUMP_OUTPUT_RECOMMENDATION });
+  res.json({
+    ...getPumpOutputSettings(),
+    recommendation: PUMP_OUTPUT_RECOMMENDATION,
+    status: getPumpOutputStatus()
+  });
 });
 
-app.post("/api/config/pump-output", (req, res) => {
+// Opening a serial port is asynchronous, so the instant after initPumpOutput()
+// returns the output is always still "unavailable". Settling briefly before
+// reporting means the operator sees the actual outcome of what they just did
+// instead of a failure that corrects itself a moment later.
+const PUMP_OUTPUT_SETTLE_MS = 2000;
+
+async function applyPumpOutputChange() {
+  initPumpOutput();
+  await new Promise((resolve) => setTimeout(resolve, PUMP_OUTPUT_SETTLE_MS));
+  evaluatePumpControl();
+  return getPumpOutputStatus();
+}
+
+app.post("/api/config/pump-output", async (req, res) => {
   if (req.body?.confirm !== true) {
     res.status(400).json({ error: "Pump output changes require confirm=true." });
     return;
   }
 
+  let next;
   try {
-    const next = sanitizePumpOutputSettings(req.body);
+    next = sanitizePumpOutputSettings(req.body);
     saveStoredJsonSetting("pumpOutput", next);
     logPumpEvent("output-config", "Pump output hardware changed from dashboard.", statements.latest.get());
-    res.json({ ...next, recommendation: PUMP_OUTPUT_RECOMMENDATION, restartRequired: true });
   } catch (error) {
     res.status(400).json({ error: error.message });
+    return;
   }
+
+  // Apply immediately rather than telling the operator to restart. Teardown
+  // releases the old export/serial connection and drives it off first, so the
+  // ordering is the same one a restart used to provide.
+  const status = await applyPumpOutputChange();
+  res.json({ ...next, recommendation: PUMP_OUTPUT_RECOMMENDATION, status });
+});
+
+// Re-scan for the relay on demand. This is the "I just plugged it in" button:
+// USB devices that appear after the app started, or that came back on a
+// different /dev path, are picked up here instead of at the next reboot.
+app.post("/api/config/pump-output/reconnect", async (req, res) => {
+  if (req.body?.confirm !== true) {
+    res.status(400).json({ error: "Reconnecting the pump output requires confirm=true." });
+    return;
+  }
+
+  res.json({ status: await applyPumpOutputChange() });
 });
 
 app.post("/api/pump/settings", (req, res) => {
@@ -1332,6 +1968,21 @@ const server = app.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`Water monitor dashboard listening on http://${CONFIG.host}:${CONFIG.port}`);
   initPumpOutput();
   evaluatePumpControl();
+  // Roll usage up before the first prune so that a day about to fall out of
+  // the readings retention window is captured in daily_usage first.
+  try {
+    refreshDailyUsage({ full: true });
+  } catch (error) {
+    console.error(`Initial usage rollup failed: ${error.message}`);
+  }
+  setInterval(() => {
+    try {
+      refreshDailyUsage();
+    } catch (error) {
+      console.error(`Usage rollup failed: ${error.message}`);
+    }
+  }, 60 * 60 * 1000).unref();
+
   pruneOldReadings();
   setInterval(pruneOldReadings, clamp(CONFIG.pruneIntervalHours, 1, 168) * 60 * 60 * 1000).unref();
   setInterval(evaluatePumpControl, 60 * 1000).unref();

@@ -538,6 +538,85 @@ td {
   font-size: 1.05rem;
 }
 
+.usage-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.usage-item {
+  display: grid;
+  gap: 6px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0d171e;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-item span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.usage-item strong {
+  font-size: 1.6rem;
+}
+
+.usage-months {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-start;
+  gap: 6px;
+  min-height: 96px;
+  overflow-x: auto;
+}
+
+.usage-month {
+  /* Capped so a history of only two or three months renders as readable bars
+     rather than stretching into full-width blocks. */
+  flex: 1 1 28px;
+  max-width: 72px;
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+}
+
+.usage-bar-track {
+  display: flex;
+  align-items: flex-end;
+  width: 100%;
+  height: 68px;
+  border-radius: 4px;
+  background: rgba(74, 193, 255, 0.08);
+}
+
+.usage-bar {
+  width: 100%;
+  border-radius: 4px;
+  background: var(--blue);
+}
+
+.usage-month span {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.relay-status-row {
+  display: grid;
+  gap: 8px;
+}
+
 .config-shell {
   max-width: 960px;
 }
@@ -636,6 +715,10 @@ td {
 }
 
 @media (max-width: 1180px) {
+  .usage-grid {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+
   .content-grid {
     grid-template-columns: 1fr 1fr;
   }

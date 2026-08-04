@@ -85,6 +85,41 @@
         </form>
       </section>
 
+      <section class="panel usage-panel" aria-label="Estimated water usage">
+        <div class="section-head">
+          <div>
+            <p class="label">Water Used</p>
+            <h2>Estimated Consumption</h2>
+          </div>
+          <div class="config-status" id="usageSource">Loading</div>
+        </div>
+
+        <div class="usage-grid">
+          <div class="usage-item">
+            <span>Last 2 Years</span>
+            <strong id="usage730">--</strong>
+          </div>
+          <div class="usage-item">
+            <span>Last 12 Months</span>
+            <strong id="usage365">--</strong>
+          </div>
+          <div class="usage-item">
+            <span>Last 30 Days</span>
+            <strong id="usage30">--</strong>
+          </div>
+          <div class="usage-item">
+            <span>Last 7 Days</span>
+            <strong id="usage7">--</strong>
+          </div>
+        </div>
+
+        <div class="usage-months" id="usageMonths"></div>
+
+        <p class="last-update" id="usageNote">
+          Rough estimate from tank level change plus pump run time. Not a metered figure.
+        </p>
+      </section>
+
       <section class="content-grid">
         <article class="panel trend-panel">
           <div class="section-head">

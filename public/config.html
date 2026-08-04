@@ -72,6 +72,58 @@
       <section class="panel config-panel">
         <div class="section-head">
           <div>
+            <p class="label">Usage</p>
+            <h2>Tank Size &amp; Water Usage</h2>
+          </div>
+          <div class="config-status" id="usageConfigStatus">Loading</div>
+        </div>
+
+        <p class="last-update">
+          There is no flow meter on this system. Gallons used are estimated from how much the
+          tank level drops, plus how long the pump runs. Only the tank's <em>inside diameter</em>
+          is needed &mdash; usage comes from changes in level, so the 1 ft offset between this
+          sensor and the tank's physical gauge cancels out.
+        </p>
+
+        <form class="config-form" id="usageForm">
+          <label>
+            <span>Tank Inside Diameter (ft)</span>
+            <input id="usageTankDiameter" name="tankDiameterFeet" type="number" min="0" max="500" step="0.5" placeholder="33">
+          </label>
+
+          <label>
+            <span>Gallons Per Foot (0 = calculate from diameter)</span>
+            <input id="usageGallonsPerFootOverride" name="gallonsPerFootOverride" type="number" min="0" max="1000000" step="1" placeholder="0">
+          </label>
+
+          <p class="config-status" id="usageGallonsPerFoot"></p>
+
+          <label class="toggle-row">
+            <input id="usageAutoPumpRate" type="checkbox">
+            <span>Work out the pump's flow rate automatically</span>
+          </label>
+
+          <label>
+            <span>Pump Flow Rate (gal/min)</span>
+            <input id="usagePumpRate" name="pumpRateGpm" type="number" min="0" max="10000" step="1" placeholder="0">
+          </label>
+
+          <p class="last-update">
+            Water drawn <em>while the pump is filling</em> is hidden by the incoming water, so the
+            pump's flow rate is needed to add it back. Left automatic, it is inferred from how fast
+            the tank actually rose during past fills. The manual value is used when automatic
+            detection has nothing to go on yet.
+          </p>
+
+          <div class="config-actions">
+            <button id="saveUsageButton" type="submit">Save Tank &amp; Usage Settings</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="section-head">
+          <div>
             <p class="label">ntfy</p>
             <h2>LAN Notification Server</h2>
           </div>
@@ -156,6 +208,10 @@
               <input id="pumpUsbRelayBaud" name="usbRelayBaud" type="number" min="1200" max="115200" step="1" placeholder="9600">
             </label>
             <button id="refreshSerialPortsButton" type="button">Refresh Port List</button>
+            <p class="last-update">
+              Just plugged the relay in? Press <strong>Refresh Port List</strong> - newly connected
+              USB devices show up here without restarting anything.
+            </p>
 
             <label class="toggle-row">
               <input id="pumpUsbRelayLockToIdentity" type="checkbox">
@@ -170,10 +226,14 @@
             <p class="config-status" id="pumpUsbRelayIdentity"></p>
           </div>
 
-          <p class="last-update">Changing this requires an app restart to take effect.</p>
+          <div class="relay-status-row">
+            <span class="label">Relay Hardware</span>
+            <span class="config-status" id="pumpOutputLiveStatus">Checking</span>
+          </div>
 
           <div class="config-actions">
             <button id="savePumpOutputButton" type="submit">Save Pump Output Settings</button>
+            <button id="reconnectRelayButton" type="button">Detect / Reconnect Relay</button>
           </div>
         </form>
       </section>

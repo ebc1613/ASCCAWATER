@@ -39,5 +39,14 @@ CREATE TABLE IF NOT EXISTS daily_usage (
   day TEXT PRIMARY KEY,            -- local calendar date, YYYY-MM-DD
   gallons REAL NOT NULL,          -- estimated water consumed that day
   pump_rate REAL,                 -- gal/min pump inflow rate used for the estimate
-  computed_at TEXT NOT NULL
+  computed_at TEXT NOT NULL,
+  -- The raw, unit-free inputs the estimate was built from, kept so that a
+  -- later correction to tank size or pump rate can be applied to days whose
+  -- underlying readings have already been pruned. Without these, changing the
+  -- tank diameter would leave two years of history computed against the old
+  -- number with no way to reconcile it.
+  drop_feet REAL,                 -- net level drop attributed to usage, in feet
+  pump_minutes REAL,              -- minutes the pump was running that day
+  gallons_per_foot REAL,          -- conversion factor in effect when computed
+  covered_minutes REAL            -- minutes of the day actually spanned by readings
 );

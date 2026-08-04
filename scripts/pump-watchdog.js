@@ -45,6 +45,17 @@ const CONFIG = {
   intervalSeconds: Number.parseFloat(process.env.WATCHDOG_INTERVAL_SECONDS || "5"),
   failureThreshold: Number.parseInt(process.env.WATCHDOG_FAILURE_THRESHOLD || "3", 10),
   maxRuntimeMinutes: Number.parseFloat(process.env.WATCHDOG_MAX_RUNTIME_MINUTES || "150"),
+  // How long to wait, at watchdog startup only, for the main app to come up
+  // before treating silence as a failure. systemd starts both services
+  // together at boot (After= orders the start, it does not wait for the app to
+  // be listening), and the main app needs several seconds to open its
+  // database and bind port 80. Without this, the watchdog reached its 3-strike
+  // threshold ~15s into every boot and "rescued" a system that was merely
+  // still starting: it rewrote the saved pump mode to manual_off and pushed an
+  // urgent "EMERGENCY cutoff" notification, every single time the machine was
+  // restarted. That is what made saved settings look like they did not
+  // survive a reboot.
+  startupGraceSeconds: Number.parseFloat(process.env.WATCHDOG_STARTUP_GRACE_SECONDS || "90"),
   requestTimeoutMs: 3000,
   gpioPin: Number.parseInt(process.env.PUMP_GPIO_PIN || "17", 10),
   gpioActiveHigh: String(process.env.PUMP_GPIO_ACTIVE_HIGH || "true").toLowerCase() !== "false",
@@ -62,6 +73,25 @@ let consecutiveFailures = 0;
 let unhealthy = false;
 let pumpOnObservedSince = null;
 let maxRuntimeTripped = false;
+let everReachedApp = false;
+let lastForcedOffAt = 0;
+let cutoffFailureNotified = false;
+
+const FORCE_OFF_MIN_INTERVAL_MS = 30 * 1000;
+
+const startupGraceUntil = Date.now() + Math.max(0, CONFIG.startupGraceSeconds) * 1000;
+
+// The grace window only covers the gap between this process starting and the
+// main app becoming reachable for the first time. Once we have heard from the
+// app even once, a later silence is a real failure and is acted on
+// immediately - a crash two hours into a run gets no grace at all.
+//
+// Nothing is at risk during the window: the relay is de-energized whenever it
+// is unpowered or freshly opened, and the main app has not had the chance to
+// energize anything yet either.
+function inStartupGrace() {
+  return !everReachedApp && Date.now() < startupGraceUntil;
+}
 
 function getOutputSettings() {
   // Read the live setting the main app actually uses, if the database is
@@ -78,7 +108,15 @@ function getOutputSettings() {
       return {
         type: stored.type === "usb_relay" ? "usb_relay" : "gpio",
         gpioPin: Number.isFinite(Number(stored.gpioPin)) ? Number(stored.gpioPin) : CONFIG.gpioPin,
-        gpioActiveHigh: Boolean(stored.gpioActiveHigh),
+        // Fall back to the configured polarity rather than Boolean(undefined).
+        // Getting this wrong inverts the meaning of "off": on an active-high
+        // board, a stored row missing this key would have had the watchdog
+        // write a 1 to force the pump *off*, energizing it instead. The main
+        // app always writes the key, but the one process whose job is to be
+        // the last line of defense should not depend on that.
+        gpioActiveHigh: stored.gpioActiveHigh === undefined
+          ? CONFIG.gpioActiveHigh
+          : Boolean(stored.gpioActiveHigh),
         usbRelayPort: stored.usbRelayPort || CONFIG.usbRelayPort,
         usbRelayBaud: Number.isFinite(Number(stored.usbRelayBaud)) ? Number(stored.usbRelayBaud) : CONFIG.usbRelayBaud,
         usbRelayVendorId: stored.usbRelayVendorId || CONFIG.usbRelayVendorId,
@@ -210,7 +248,51 @@ async function resolveUsbRelayPath(settings) {
   }
 }
 
-async function forceRelayOff(reason) {
+// Cached across trips on purpose. The previous version called unexport() after
+// every GPIO write, which tears the pin's sysfs node down for *every* process
+// using it - including the main app, whose still-open file descriptor then
+// becomes invalid. A watchdog trip could therefore permanently break the main
+// app's ability to drive the pin until it was restarted, turning a transient
+// blip into a hard outage. Holding the export costs nothing and the pin stays
+// driven low.
+let cachedGpio = null;
+
+function driveGpioOff(settings) {
+  const { Gpio } = require("onoff");
+  if (!cachedGpio || cachedGpio.pin !== settings.gpioPin) {
+    cachedGpio = { pin: settings.gpioPin, gpio: new Gpio(settings.gpioPin, "out") };
+  }
+  cachedGpio.gpio.writeSync(settings.gpioActiveHigh ? 0 : 1);
+}
+
+function reportCutoffFailure(detail) {
+  console.error(`Watchdog: ${detail}`);
+  if (cutoffFailureNotified) return;
+  cutoffFailureNotified = true;
+  sendNtfyAlert(
+    "Water pump CUTOFF FAILED - go check the tank",
+    "The backup safety system tried to force the pump OFF and could not reach the relay hardware to do it.\n\n" +
+    `Details: ${detail}\n\n` +
+    "This means nothing in software is currently able to stop the pump.\n\n" +
+    "WHAT TO DO NOW:\n" +
+    "1. Go to the tank and the pump in person.\n" +
+    "2. If the pump is running and the tank is filling toward overflow, cut power to the pump at the breaker or manual disconnect.\n" +
+    "3. Call maintenance.\n\n" +
+    "Do not wait for this to fix itself.",
+    { tags: "rotating_light", priority: "urgent" }
+  );
+}
+
+async function forceRelayOff(reason, options = {}) {
+  // Once tripped, the callers below keep calling this on every 5s poll. Doing
+  // the full sequence that often means re-opening the database and the serial
+  // port twelve times a minute for as long as the fault lasts. The first
+  // cutoff is always immediate; the repeats that only exist to hold the relay
+  // down are throttled.
+  const now = Date.now();
+  if (!options.immediate && now - lastForcedOffAt < FORCE_OFF_MIN_INTERVAL_MS) return;
+  lastForcedOffAt = now;
+
   forcePersistedModeToManualOff(reason);
 
   const settings = getOutputSettings();
@@ -218,7 +300,7 @@ async function forceRelayOff(reason) {
   if (settings.type === "usb_relay") {
     const path = await resolveUsbRelayPath(settings);
     if (!path) {
-      console.error("Watchdog: no USB relay found (by port or vendor/product ID), cannot force pump off.");
+      reportCutoffFailure("no USB relay found (by port or vendor/product ID), cannot force pump off.");
       return;
     }
     const { SerialPort } = require("serialport");
@@ -230,26 +312,34 @@ async function forceRelayOff(reason) {
     // cutoff would silently not happen. This must work regardless of
     // whatever the main app is doing with the port.
     const port = new SerialPort({ path, baudRate: settings.usbRelayBaud, autoOpen: false, lock: false });
+    // A port that errors after opening must not take the process down - this
+    // is the watchdog, and an unhandled 'error' event would be fatal.
+    port.on("error", (error) => reportCutoffFailure(`USB relay port error during cutoff: ${error.message}`));
     port.open((error) => {
       if (error) {
-        console.error(`Watchdog: could not open USB relay port to force pump off: ${error.message}`);
+        reportCutoffFailure(`could not open USB relay port to force pump off: ${error.message}`);
         return;
       }
       port.write(USB_RELAY_OFF, (writeError) => {
-        if (writeError) console.error(`Watchdog: USB relay off write failed: ${writeError.message}`);
-        port.close();
+        if (writeError) {
+          reportCutoffFailure(`USB relay off write failed: ${writeError.message}`);
+        } else {
+          cutoffFailureNotified = false;
+          console.warn(`Watchdog: forced USB relay OFF at ${path} (${reason}).`);
+        }
+        port.close(() => {});
       });
     });
     return;
   }
 
   try {
-    const { Gpio } = require("onoff");
-    const gpio = new Gpio(settings.gpioPin, "out");
-    gpio.writeSync(settings.gpioActiveHigh ? 0 : 1);
-    gpio.unexport();
+    driveGpioOff(settings);
+    cutoffFailureNotified = false;
+    console.warn(`Watchdog: forced GPIO pin ${settings.gpioPin} OFF (${reason}).`);
   } catch (error) {
-    console.error(`Watchdog: could not drive GPIO pin to force pump off: ${error.message}`);
+    cachedGpio = null;
+    reportCutoffFailure(`could not drive GPIO pin to force pump off: ${error.message}`);
   }
 }
 
@@ -287,6 +377,7 @@ function onStatus(status) {
   }
   consecutiveFailures = 0;
   unhealthy = false;
+  everReachedApp = true;
 
   if (!status.pumpOn) {
     pumpOnObservedSince = null;
@@ -317,12 +408,22 @@ function onStatus(status) {
         { tags: "rotating_light", priority: "urgent" }
       );
     }
+    const firstTrip = !maxRuntimeTripped;
     maxRuntimeTripped = true;
-    forceRelayOff(`independent max runtime of ${CONFIG.maxRuntimeMinutes} minutes exceeded`);
+    forceRelayOff(
+      `independent max runtime of ${CONFIG.maxRuntimeMinutes} minutes exceeded`,
+      { immediate: firstTrip }
+    );
   }
 }
 
 function onUnreachable(detail) {
+  if (inStartupGrace()) {
+    console.log(`Watchdog: main app not up yet (${detail}). Within the ` +
+      `${CONFIG.startupGraceSeconds}s startup grace window, so not treating this as a failure.`);
+    return;
+  }
+
   consecutiveFailures += 1;
   console.warn(`Watchdog: status check failed (${consecutiveFailures}/${CONFIG.failureThreshold}): ${detail}`);
 
@@ -340,14 +441,16 @@ function onUnreachable(detail) {
         { tags: "rotating_light", priority: "urgent" }
       );
     }
+    const firstTrip = !unhealthy;
     unhealthy = true;
-    forceRelayOff("main app unreachable");
+    forceRelayOff("main app unreachable", { immediate: firstTrip });
   }
 }
 
 console.log(`Pump watchdog started. Polling ${CONFIG.statusUrl} every ${CONFIG.intervalSeconds}s. ` +
   `Forces pump off after ${CONFIG.failureThreshold} consecutive failed checks, or after ` +
-  `${CONFIG.maxRuntimeMinutes} minutes of independently observed continuous runtime, whichever comes first.`);
+  `${CONFIG.maxRuntimeMinutes} minutes of independently observed continuous runtime, whichever comes first. ` +
+  `Allowing ${CONFIG.startupGraceSeconds}s for the main app to come up before the first check counts.`);
 
 checkStatus();
 setInterval(checkStatus, Math.max(1, CONFIG.intervalSeconds) * 1000);

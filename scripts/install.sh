@@ -9,6 +9,10 @@ DEFAULTS_FILE="/etc/default/water-monitor"
 NTFY_PORT="${NTFY_PORT:-8081}"
 INSTALL_NTFY="${INSTALL_NTFY:-true}"
 INSTALL_TAILSCALE="${INSTALL_TAILSCALE:-true}"
+# Mask brltty so it stops claiming the CH340 USB relay. Safe on this deployment
+# (headless well-house box, maintenance access only, no braille display).
+# Set to false when installing anywhere a person actually uses the machine.
+DISABLE_BRLTTY="${DISABLE_BRLTTY:-true}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "Run this installer with sudo." >&2
@@ -39,6 +43,58 @@ cd "${APP_DIR}"
 npm install --omit=dev
 
 usermod -aG dialout "${APP_USER}" || true
+
+# Keep ModemManager off the USB relay, and give it a stable path.
+#
+# ModemManager probes any newly appeared serial device looking for a modem,
+# holding the port open and writing AT commands at it for several seconds
+# after plug-in. ID_MM_DEVICE_IGNORE tells it to skip this device. The SYMLINK
+# gives a stable /dev/water-relay path regardless of ttyUSB renumbering, and
+# the group/mode make sure the service account can open it without a relogin.
+install -m 0644 /dev/stdin /etc/udev/rules.d/60-water-relay.rules <<'UDEV'
+# CH340/CH341 USB-serial (common LCUS-style relay boards)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+  ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", \
+  MODE="0660", GROUP="dialout", SYMLINK+="water-relay"
+UDEV
+udevadm control --reload-rules || true
+udevadm trigger --subsystem-match=tty || true
+
+# brltty is the other well-known claimer of CH340 adapters: it recognizes
+# several CH340 product IDs as braille displays, grabs the port a second or two
+# after it appears, and the device then vanishes from /dev. That produces
+# exactly the "relay is not detected until I reboot" symptom, because on a cold
+# boot this app can win the race but on a hot plug brltty always does.
+#
+# Disabled here at the operator's instruction: this is a headless well-house
+# controller that only maintenance staff ever touch, and no braille display is
+# or will be attached to it. Note that this is a machine-wide change, so if this
+# box is ever repurposed as something a person actually sits at, undo it -
+# masking is fully reversible and the command to reverse it is printed below.
+#
+# Set DISABLE_BRLTTY=false to skip this, e.g. when installing on a machine
+# where braille support matters.
+if [[ "${DISABLE_BRLTTY}" == "true" ]] \
+  && systemctl list-unit-files 2>/dev/null | grep -q '^brltty-udev\.service'; then
+  echo
+  echo "Stopping brltty from claiming USB serial devices..."
+  systemctl stop brltty-udev.service 2>/dev/null || true
+  systemctl mask brltty-udev.service || true
+  # The udev-triggered path is the one that grabs the relay, but the standalone
+  # daemon can re-probe too, so quiet both if they exist.
+  systemctl disable --now brltty.service 2>/dev/null || true
+  echo "  brltty-udev.service is masked. The USB relay will no longer be claimed by it."
+  echo "  This is reversible at any time:"
+  echo "      sudo systemctl unmask brltty-udev.service"
+  echo "      sudo systemctl start brltty-udev.service"
+  echo "  Do that first if a braille display is ever used on this machine."
+elif [[ "${DISABLE_BRLTTY}" != "true" ]]; then
+  echo
+  echo "NOTE: leaving brltty alone (DISABLE_BRLTTY=${DISABLE_BRLTTY})."
+  echo "  If the relay is detected on a cold boot but never on a hot plug, brltty"
+  echo "  claiming the CH340 adapter is the likely cause."
+fi
+
 systemctl daemon-reload
 systemctl enable --now water-monitor
 systemctl enable --now water-monitor-watchdog
