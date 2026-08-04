@@ -29,6 +29,9 @@ const els = {
   pumpOffFeet: document.getElementById("pumpOffFeet"),
   pumpStaleMinutes: document.getElementById("pumpStaleMinutes"),
   pumpMaxHours: document.getElementById("pumpMaxHours"),
+  pumpBlocked: document.getElementById("pumpBlocked"),
+  pumpBlockedHeadline: document.getElementById("pumpBlockedHeadline"),
+  pumpBlockedDetail: document.getElementById("pumpBlockedDetail"),
   usageSource: document.getElementById("usageSource"),
   usage730: document.getElementById("usage730"),
   usage365: document.getElementById("usage365"),
@@ -115,9 +118,49 @@ function renderLatest(payload) {
   setAlarm(reading.alarm);
 }
 
+// Several safety checks run before the selected mode is even consulted, and
+// each one holds the pump off and returns. When that happens the mode button
+// still lights up as selected, which reads as "it worked" while nothing
+// physically moves. Say so plainly instead.
+function describePumpBlock(status) {
+  if (status.enabled === false) {
+    return {
+      headline: "Pump control is switched off for this installation.",
+      detail: "The relay is connected and your mode choice is saved, but nothing will be energized - "
+        + "the pump cannot run in any mode until pump control is turned on. This is the deliberate "
+        + "safety gate for wiring that is not finished yet. To turn it on, set PUMP_CONTROL_ENABLED=true "
+        + "in /etc/default/water-monitor and restart the service, and only after the relay, contactor, "
+        + "disconnect, and breaker are all in place."
+    };
+  }
+
+  if (status.pumpOn) return null;
+
+  // Mode asks for the pump to run, but something upstream is refusing.
+  const wantsOn = status.mode === "manual_on";
+  if (!wantsOn) return null;
+
+  return {
+    headline: "Manual On is selected, but the pump is being held off.",
+    detail: status.fault || status.reason || "Reason unavailable."
+  };
+}
+
+function renderPumpBlock(status) {
+  const block = describePumpBlock(status);
+  if (!block) {
+    els.pumpBlocked.hidden = true;
+    return;
+  }
+  els.pumpBlockedHeadline.textContent = block.headline;
+  els.pumpBlockedDetail.textContent = block.detail;
+  els.pumpBlocked.hidden = false;
+}
+
 function renderPump(status) {
   if (!status) return;
   pumpStatus = status;
+  renderPumpBlock(status);
   const isOn = Boolean(status.pumpOn);
   const isFault = Boolean(status.fault);
   const modeLabel = {

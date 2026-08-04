@@ -538,6 +538,38 @@ td {
   font-size: 1.05rem;
 }
 
+.pump-blocked {
+  /* Last child in the markup so that hiding it never disturbs the panel's
+     grid, but ordered first so the warning reads above the controls it is
+     explaining. Spans every column of .pump-panel. */
+  grid-column: 1 / -1;
+  order: -1;
+  display: grid;
+  gap: 6px;
+  margin: 0 0 4px;
+  padding: 14px 16px;
+  border-left: 4px solid var(--yellow);
+  border-radius: 8px;
+  background: rgba(240, 198, 74, 0.12);
+}
+
+.pump-blocked[hidden] {
+  display: none;
+}
+
+.pump-blocked-headline {
+  margin: 0;
+  color: var(--yellow);
+  font-weight: 900;
+  font-size: 1.02rem;
+}
+
+.pump-blocked-detail {
+  margin: 0;
+  color: #d9e7ee;
+  line-height: 1.5;
+}
+
 .usage-panel {
   display: grid;
   gap: 18px;
