@@ -96,8 +96,15 @@ elif [[ "${DISABLE_BRLTTY}" != "true" ]]; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now water-monitor
-systemctl enable --now water-monitor-watchdog
+systemctl enable water-monitor
+systemctl enable water-monitor-watchdog
+# `enable --now` only starts a stopped unit - on a re-install where the
+# service is already running, it is a no-op and the old code stays loaded in
+# memory even though new files just landed in APP_DIR. Explicit restart is
+# what actually picks up new code on every run of this script, first install
+# or not.
+systemctl restart water-monitor
+systemctl restart water-monitor-watchdog
 
 echo "Installed water-monitor and its pump watchdog."
 echo "Check logs with: journalctl -u water-monitor -f"
