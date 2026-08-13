@@ -58,6 +58,24 @@ Environment variables:
 
 - `SERIAL_PORT`: fallback path for the receiver, used only when no device matches its USB ID, default `/dev/water-radio` (a stable symlink the installer's udev rule creates)
 - `SERIAL_VENDOR_ID` / `SERIAL_PRODUCT_ID`: USB identity of the LoRa receiver board, default `10c4`/`ea60`. The receiver and the pump relay are both USB-serial devices on this machine and `ttyUSB` numbering follows boot enumeration order, so each is matched by identity and neither is ever allowed to open the other's port. If your receiver is a clone with a CH340 (`1a86:7523`, the same chip as the relay), set these to match it and give the relay a distinct identity - otherwise the two cannot be told apart. `GET /api/system/serial-ports` labels every detected device with the role the app assigns it.
+
+### Which USB device is the radio? (proving it, not guessing)
+
+USB vendor/product matching is a good default but it is still inference - it says "this device has the chip a receiver usually has," not "this device *is* the receiver." To settle it with evidence:
+
+```bash
+sudo -u watermonitor node /opt/water-monitor/scripts/identify-serial.js
+```
+
+It reports the strongest evidence available, in this order:
+
+1. **CONFIRMED (live)** - the running app parsed a real tank reading off that port. Nothing else on the machine emits a tank reading, so this is proof. Costs nothing and touches no hardware.
+2. **CONFIRMED (probe)** - the tool opened each port, pulsed the ESP32's reset line, and the board answered with its ROM boot banner (`ESP-ROM:esp32s3-...`) or printed a reading. Only an ESP32 does that; the relay is electrically incapable of it.
+3. **SILENT** - the port said nothing, which is what a relay does. Not proof by itself, but combined with (2) on another port it is how the two are told apart.
+
+It never writes a byte to any port, skips the configured relay unless given `--include-relay`, and refuses to probe at all while the pump is running. `--no-probe` restricts it to evidence the app already has. Because readings only arrive every ~5 minutes, `--seconds 320` waits out a full transmit cycle if you need a reading rather than a boot banner as the proof.
+
+The same distinction shows up in the UI and the API: `GET /api/system/serial-ports` marks each port with a `role` (inferred from USB ID) and a separate `confirmed` flag (a reading was actually parsed from it), and the relay picker labels a confirmed receiver as such.
 - `BAUD_RATE`: serial baud rate, default `115200`
 - `PORT`: HTTP port, default `80`
 - `HOST`: HTTP bind address, default `0.0.0.0`

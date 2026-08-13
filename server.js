@@ -1960,6 +1960,12 @@ app.get("/api/system/serial-ports", async (req, res) => {
     const ports = await SerialPort.list();
     const relaySettings = getPumpOutputSettings();
     const held = sensorHeldPath();
+    // A reading within two transmit cycles (~5 min each) counts as live proof
+    // that the held port really is the receiver.
+    const radioConfirmedAt = serialState.lastLineAt &&
+      Date.now() - new Date(serialState.lastLineAt).getTime() < 11 * 60 * 1000
+      ? serialState.lastLineAt
+      : null;
 
     // Say what each USB device *is*, not just where it lives. A bare list of
     // /dev paths is what made the receiver and the relay so easy to confuse in
@@ -1987,7 +1993,12 @@ app.get("/api/system/serial-ports", async (req, res) => {
         vendorId: port.vendorId || null,
         productId: port.productId || null,
         role: roleOf(port),
-        inUseByRadio: port.path === held
+        inUseByRadio: port.path === held,
+        // "confirmed" means proven, not inferred: a real tank reading was
+        // parsed off this port recently. role alone is a guess from the USB
+        // chip ID, which cannot tell a receiver from a relay that happens to
+        // use the same bridge. Nothing but the receiver emits a reading.
+        confirmed: port.path === held && radioConfirmedAt !== null
       })),
       // What the app believes the receiver is, so the Settings page can show
       // "the radio is this device" instead of leaving it to be inferred.
@@ -1996,6 +2007,7 @@ app.get("/api/system/serial-ports", async (req, res) => {
         productId: CONFIG.serialProductId,
         connectedPath: held,
         resolvedBy: serialState.resolvedBy,
+        confirmedAt: radioConfirmedAt,
         lastError: serialState.lastError
       },
       // So the relay port picker can avoid defaulting to (or silently

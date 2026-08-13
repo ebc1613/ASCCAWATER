@@ -318,7 +318,9 @@ function populatePortSelect(selectedPath) {
     option.value = port.path;
     const isSensor = isRadioPort(port);
     const label = port.manufacturer ? `${port.path} (${port.manufacturer})` : port.path;
-    option.textContent = isSensor ? `${label} - LoRa radio receiver, not the relay` : label;
+    option.textContent = isSensor
+      ? `${label} - ${port.confirmed ? "CONFIRMED LoRa radio receiver" : "LoRa radio receiver"}, not the relay`
+      : label;
     select.appendChild(option);
   }
 

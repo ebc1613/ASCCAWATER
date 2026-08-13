@@ -8,7 +8,8 @@
     "start:lowmem": "NODE_OPTIONS=--max-old-space-size=96 node server.js",
     "dev": "SIMULATE=true PORT=8080 node server.js",
     "demo": "PORT=8080 node demo-server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "identify": "node scripts/identify-serial.js"
   },
   "keywords": [
     "raspberry-pi",
