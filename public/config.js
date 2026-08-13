@@ -316,9 +316,9 @@ function populatePortSelect(selectedPath) {
   for (const port of knownSerialPorts) {
     const option = document.createElement("option");
     option.value = port.path;
-    const isSensor = Boolean(knownSensorPort) && port.path === knownSensorPort;
+    const isSensor = isRadioPort(port);
     const label = port.manufacturer ? `${port.path} (${port.manufacturer})` : port.path;
-    option.textContent = isSensor ? `${label} - water sensor, not the relay` : label;
+    option.textContent = isSensor ? `${label} - LoRa radio receiver, not the relay` : label;
     select.appendChild(option);
   }
 
@@ -332,7 +332,7 @@ function populatePortSelect(selectedPath) {
   // relay port should fall through to "Custom path..." instead, forcing a
   // deliberate choice, rather than pre-selecting whichever device the OS
   // happened to enumerate first (which is often the sensor).
-  const firstNonSensorPort = knownSerialPorts.find((port) => port.path !== knownSensorPort);
+  const firstNonSensorPort = knownSerialPorts.find((port) => !isRadioPort(port));
   select.value = matchesDetected
     ? selectedPath
     : (selectedPath ? CUSTOM_PORT_VALUE : (firstNonSensorPort?.path || CUSTOM_PORT_VALUE));
@@ -340,6 +340,14 @@ function populatePortSelect(selectedPath) {
     pumpOutputEls.usbRelayPort.value = selectedPath;
   }
   updateCustomPortVisibility();
+}
+
+// The server tags every detected port with the role it believes it plays.
+// Trusting that tag rather than a single remembered path matters when the OS
+// renumbers devices: the radio can move to a path the picker has never seen,
+// and a stale path comparison would then happily offer the radio as the relay.
+function isRadioPort(port) {
+  return Boolean(port) && port.role === "radio";
 }
 
 function getSelectedUsbRelayPort() {
@@ -354,13 +362,14 @@ function getSelectedUsbRelayIdentity() {
 
 function updateUsbRelayIdentityDisplay() {
   const identity = getSelectedUsbRelayIdentity();
-  const isSensorPort = Boolean(knownSensorPort) && getSelectedUsbRelayPort() === knownSensorPort;
+  const isSensorPort = isRadioPort(identity) ||
+    (Boolean(knownSensorPort) && getSelectedUsbRelayPort() === knownSensorPort);
 
   if (isSensorPort) {
     pumpOutputEls.usbRelayLockToIdentity.checked = false;
     pumpOutputEls.usbRelayLockToIdentity.disabled = true;
     pumpOutputEls.usbRelayIdentity.textContent =
-      "This is the water-level sensor's port, not the relay - pick a different port before locking.";
+      "This is the LoRa radio receiver's port, not the relay - pick a different port before locking.";
   } else if (identity && identity.vendorId && identity.productId) {
     pumpOutputEls.usbRelayLockToIdentity.disabled = false;
     pumpOutputEls.usbRelayIdentity.textContent = `Detected device: ${identity.vendorId}:${identity.productId}`;

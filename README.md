@@ -6,8 +6,8 @@ This is monitor-only software. It does not control pumps, valves, chlorinators, 
 
 ## Features
 
-- Reads `/dev/ttyUSB0` by default.
-- Override serial device with `SERIAL_PORT=/dev/ttyACM0`.
+- Finds the LoRa receiver by its USB vendor/product ID (`10c4:ea60`, the Heltec V3's CP2102 bridge), falling back to `SERIAL_PORT` (`/dev/water-radio`) if nothing matches.
+- Override the identity with `SERIAL_VENDOR_ID`/`SERIAL_PRODUCT_ID`, or the fallback path with `SERIAL_PORT=/dev/ttyACM0`.
 - Stores water level, PSI, battery, RSSI, SNR, sequence, tower, and timestamp in SQLite.
 - Live dashboard updates with Server-Sent Events.
 - Starts normally when the serial device is missing and shows `Waiting for Data`.
@@ -56,7 +56,8 @@ The production app listens on `0.0.0.0:80`.
 
 Environment variables:
 
-- `SERIAL_PORT`: serial device path, default `/dev/ttyUSB0`
+- `SERIAL_PORT`: fallback path for the receiver, used only when no device matches its USB ID, default `/dev/water-radio` (a stable symlink the installer's udev rule creates)
+- `SERIAL_VENDOR_ID` / `SERIAL_PRODUCT_ID`: USB identity of the LoRa receiver board, default `10c4`/`ea60`. The receiver and the pump relay are both USB-serial devices on this machine and `ttyUSB` numbering follows boot enumeration order, so each is matched by identity and neither is ever allowed to open the other's port. If your receiver is a clone with a CH340 (`1a86:7523`, the same chip as the relay), set these to match it and give the relay a distinct identity - otherwise the two cannot be told apart. `GET /api/system/serial-ports` labels every detected device with the role the app assigns it.
 - `BAUD_RATE`: serial baud rate, default `115200`
 - `PORT`: HTTP port, default `80`
 - `HOST`: HTTP bind address, default `0.0.0.0`
@@ -155,7 +156,7 @@ Current defaults:
 - Auto on below `2.0 ft`
 - Auto off at `7.2 ft`
 - Stop pump after `15 minutes` without a LoRa reading
-- Stop pump after `120 minutes` continuous runtime
+- Stop pump after `120 minutes` continuous runtime (raise this from **Max Run Hours** on the dashboard)
 - Startup mode is `Manual Off`
 
 The dashboard lets you change the on/off levels, stale-signal stop time, and max runtime. Saving those values requires a browser confirmation. Changing between `Auto`, `Manual On`, and `Manual Off` also requires confirmation.
@@ -174,7 +175,9 @@ If the app process dies, nothing programmatically changes the relay's state on i
    - **Liveness**: if `/api/pump/status` stops responding for `WATCHDOG_FAILURE_THRESHOLD` consecutive checks (default 3, ~15s at the default 5s interval), it opens the relay/GPIO directly and forces it off. Covers the main app being dead, deadlocked, or unreachable - a `SIGKILL`, an out-of-memory kill, a native-module segfault, anything that stops it from answering. At watchdog startup only, `WATCHDOG_STARTUP_GRACE_SECONDS` (default 90) is allowed for the main app to come up before silence counts as a failure - systemd starts both services together and `After=` only orders the start, it does not wait for the app to be listening. The grace ends the instant the app answers once, and never applies again for the life of the process, so a crash mid-run is acted on immediately. Nothing is at risk during the window: a relay is de-energized when unpowered, and the main app has not had a chance to energize anything yet either.
    - **Independent max runtime**: even while the main app is alive and reporting itself healthy, the watchdog tracks how long it has personally observed `pumpOn: true`, using its own clock - not the runtime the main app reports about itself. If that exceeds the ceiling, it forces the relay off regardless of what the main app says. This is what catches a *logic* bug (not a crash) that leaves the pump on - for example, if the main app's own auto-off threshold or max-runtime check were ever wrong, this is a second opinion that does not trust the same code that made the mistake.
 
-     The ceiling is the **Max Run Hours** value set on the dashboard, read from the status endpoint, plus `WATCHDOG_RUNTIME_GRACE_MINUTES` (default 20), capped by `WATCHDOG_MAX_RUNTIME_MINUTES`. Only the elapsed-time *measurement* is independent; the policy is shared on purpose. A fixed limit here meant the watchdog silently overruled the dashboard - a tank configured for a long fill got cut off at 2.5 hours with an urgent "ran too long" alert every time, because the two numbers had to be hand-matched and had drifted apart. Independence is about not trusting the app's observations, not about ignoring the operator's settings. The reported value is validated against the same 1..1440 minute range the app itself accepts, and a bad or missing one leaves the last good ceiling in place, so a corrupted status payload cannot talk the watchdog out of ever cutting off. The grace margin exists so the app's own cleaner stop always runs first and this fires only as a true backstop.
+     The ceiling is the **Max Run Hours** value set on the dashboard, read from the status endpoint, plus `WATCHDOG_RUNTIME_GRACE_MINUTES` (default 20). Only the elapsed-time *measurement* is independent; the policy is shared on purpose. A fixed limit here meant the watchdog silently overruled the dashboard - a tank configured for a long fill got cut off at 2.5 hours with an urgent "ran too long" alert every time, because the two numbers had to be hand-matched and had drifted apart. Independence is about not trusting the app's observations, not about ignoring the operator's settings. The reported value is validated against the same 1..1440 minute range the app itself accepts, and a bad or missing one leaves the last good ceiling in place, so a corrupted status payload cannot talk the watchdog out of ever cutting off. The grace margin exists so the app's own cleaner stop always runs first and this fires only as a true backstop.
+
+     `WATCHDOG_MAX_RUNTIME_MINUTES` no longer clamps this. It bounds only the fallback limit used before the watchdog has reached the app even once. Making the dashboard the source of truth was only half the fix: the env var went on capping the result, and because `scripts/install.sh` writes `/etc/default/water-monitor` only when that file does not already exist, every box installed before the change still carried the old flat `WATCHDOG_MAX_RUNTIME_MINUTES=150`. The watchdog kept cutting fills short at the stale number no matter what the dashboard said - the exact symptom the change was supposed to end. A value left in a config file must not be able to silently overrule the operator, so a ceiling set below the dashboard's setting is now logged as stale and ignored. The result is still bounded: the app clamps its own setting to 24 hours before reporting it, the watchdog re-validates it against that same range, and the final limit is capped at 24 hours plus the grace margin.
    On either trigger, the watchdog also makes a best-effort direct write to the database to flip the saved pump mode to `manual_off`, so that if the main app comes back, it does not immediately re-energize the pump from a stuck `auto` or `manual_on` setting. This write is why the startup grace matters: without it the watchdog reached its 3-strike threshold roughly 15 seconds into every boot, rewrote the saved pump mode, and pushed an urgent "EMERGENCY cutoff" notification - which looked exactly like the dashboard forgetting its settings on every restart. The physical relay cutoff above does not depend on this write succeeding. The watchdog runs as its own service and, by design, does **not** depend on `water-monitor.service` being up (`After=` ordering only, no `Requisite=`) - it must still come up and stay running when the main app is stopped, failed, or crashed at boot.
 6. **Hardware wiring** is the only layer that survives total power loss to the Pi or relay. Wire the relay/contactor so the pump's *normal, de-energized* state is OFF (see "Recommended hardware pattern" above) - software watchdogs cannot help if the board itself has no power.
 
@@ -187,7 +190,7 @@ Watchdog environment variables (set alongside the other `PUMP_*` variables in `/
 - `WATCHDOG_FAILURE_THRESHOLD`: consecutive failed checks before forcing the relay off, default `3`
 - `WATCHDOG_STARTUP_GRACE_SECONDS`: at watchdog startup only, how long to wait for the main app to come up before silence counts as a failure, default `90`. Ends early the moment the main app answers once. Set to `0` to disable, but expect a spurious cutoff and an urgent notification on every boot if the app takes longer than the failure threshold to start listening.
 - `WATCHDOG_RUNTIME_GRACE_MINUTES`: how far above the dashboard's Max Run Hours the watchdog's ceiling sits, default `20`. This is the gap that lets the app's own cleaner stop run first.
-- `WATCHDOG_MAX_RUNTIME_MINUTES`: absolute cap on the runtime ceiling regardless of what the app reports, default `1500` (25 hours). The app clamps its own setting to 24 hours, so this normally never binds; it exists so a bad status payload cannot raise the ceiling indefinitely.
+- `WATCHDOG_MAX_RUNTIME_MINUTES`: bound on the *fallback* runtime limit only, default `1500` (25 hours). It does not cap the Max Run Hours set on the dashboard - a value below that is treated as stale config, logged, and ignored. If you see that warning, raise the line to `1500` or delete it.
 - `WATCHDOG_FALLBACK_RUNTIME_MINUTES`: ceiling used only until the app has reported its setting even once, default `150`.
 
 The watchdog reads the `pumpOutput` setting from the same database file the main app uses (a plain file read, independent of whether the main app process is alive), so it stays in sync with whatever relay hardware was last configured in `/config.html` without needing its own copy of that setting.

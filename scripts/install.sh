@@ -34,6 +34,46 @@ chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
 
 if [[ ! -f "${DEFAULTS_FILE}" ]]; then
   install -m 0644 "${APP_DIR}/.env.example" "${DEFAULTS_FILE}"
+else
+  # Re-installs used to stop here, which meant a box kept the defaults file it
+  # was first installed with, forever. New settings shipped in .env.example
+  # never reached it, and settings whose *meaning* changed kept their old
+  # values - that is how WATCHDOG_MAX_RUNTIME_MINUTES=150 survived the change
+  # that made the watchdog follow the dashboard, and went on cutting every fill
+  # short at the stale number.
+  #
+  # Existing values are never overwritten: they are the operator's, and this
+  # script has no business silently changing what the pump does. Missing keys
+  # are appended, and drift is printed so it can be seen instead of guessed at.
+  missing=()
+  while IFS= read -r key; do
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "${DEFAULTS_FILE}" || missing+=("${key}")
+  done < <(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' "${APP_DIR}/.env.example")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    {
+      echo ""
+      echo "# Added by scripts/install.sh on $(date -Is) - new settings from .env.example."
+      for key in "${missing[@]}"; do
+        grep -m1 -E "^${key}=" "${APP_DIR}/.env.example"
+      done
+    } >> "${DEFAULTS_FILE}"
+    echo "Added ${#missing[@]} new setting(s) to ${DEFAULTS_FILE}: ${missing[*]}"
+  fi
+
+  # WATCHDOG_MAX_RUNTIME_MINUTES changed meaning: it used to be the watchdog's
+  # entire runtime limit, and is now only a bound on the pre-contact fallback.
+  # The watchdog ignores a stale low value at runtime, but leaving the line
+  # sitting there invites the next person to "fix" it back.
+  stale_ceiling="$(grep -m1 -oE '^WATCHDOG_MAX_RUNTIME_MINUTES=[0-9]+' "${DEFAULTS_FILE}" | cut -d= -f2 || true)"
+  if [[ -n "${stale_ceiling}" ]] && [[ "${stale_ceiling}" -lt 1500 ]]; then
+    echo ""
+    echo "NOTE: ${DEFAULTS_FILE} sets WATCHDOG_MAX_RUNTIME_MINUTES=${stale_ceiling}."
+    echo "  That setting no longer caps the dashboard's Max Run Hours - the watchdog"
+    echo "  ignores it when it is lower and honors the dashboard instead. It only bounds"
+    echo "  the fallback limit used before the watchdog has reached the app even once."
+    echo "  Recommended: set it to 1500, or delete the line to take the default."
+  fi
 fi
 
 install -m 0644 "${APP_DIR}/systemd/water-monitor.service" "${SERVICE_FILE}"
@@ -56,6 +96,18 @@ install -m 0644 /dev/stdin /etc/udev/rules.d/60-water-relay.rules <<'UDEV'
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
   ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", \
   MODE="0660", GROUP="dialout", SYMLINK+="water-relay"
+
+# CP2102/CP2102N USB-serial - the Heltec WiFi LoRa 32 V3 receiver board.
+#
+# The receiver and the relay are the only two USB-serial devices on this box,
+# and ttyUSB numbering is assigned in whatever order they enumerate at boot.
+# Without a stable name for the receiver too, a reboot where the relay came up
+# first left the app reading the relay as if it were the radio: no readings
+# came in, and the relay was held open by the reader so the pump could not be
+# driven. Naming both ends is what removes the race, not just one.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+  ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1", \
+  MODE="0660", GROUP="dialout", SYMLINK+="water-radio"
 UDEV
 udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=tty || true

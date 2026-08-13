@@ -104,11 +104,52 @@ let appMaxRuntimeMinutes = null;
 // Only the *limit* is learned from the app. The elapsed time it is measured
 // against is always this watchdog's own clock, so an app that lies about (or
 // loses track of) how long the pump has been running still gets caught.
+// The app clamps its own max runtime to 24h before reporting it, and
+// adoptAppRuntimeLimit() re-validates it against that same range here. So a
+// value that has come from the app is already bounded, and the configured hard
+// ceiling has nothing left to protect against on that path.
+//
+// It does still protect the fallback path (used before the app has ever been
+// reached) and it stops the two numbers from drifting apart forever, so it is
+// kept - but it is no longer allowed to clamp *below* what the operator set.
+//
+// This is the second half of the bug fixed in "let the watchdog follow the
+// app's runtime limit". That change taught the watchdog to read the dashboard
+// setting, but left WATCHDOG_MAX_RUNTIME_MINUTES clamping the result - and
+// because scripts/install.sh only ever writes /etc/default/water-monitor when
+// the file does not already exist, every box installed before that change
+// still had the old flat WATCHDOG_MAX_RUNTIME_MINUTES=150 sitting in it. The
+// watchdog went on cutting every fill short at the stale env value no matter
+// what the dashboard said, which is exactly the symptom the change was meant
+// to remove. A stale config file must not be able to silently overrule the
+// operator; if it is set low, say so and honor the dashboard.
+const ABSOLUTE_MAX_RUNTIME_MINUTES = 24 * 60;
+
+let staleCeilingWarned = false;
+
 function runtimeLimitMinutes() {
-  const base = Number.isFinite(appMaxRuntimeMinutes)
-    ? appMaxRuntimeMinutes
-    : CONFIG.fallbackRuntimeMinutes;
-  return Math.min(CONFIG.hardCeilingMinutes, base + CONFIG.runtimeGraceMinutes);
+  const grace = CONFIG.runtimeGraceMinutes;
+
+  if (!Number.isFinite(appMaxRuntimeMinutes)) {
+    // Nothing heard from the app yet: the hard ceiling is the only bound there
+    // is, so it applies in full.
+    return Math.min(CONFIG.hardCeilingMinutes, CONFIG.fallbackRuntimeMinutes + grace);
+  }
+
+  const wanted = appMaxRuntimeMinutes + grace;
+
+  if (CONFIG.hardCeilingMinutes < wanted && !staleCeilingWarned) {
+    staleCeilingWarned = true;
+    console.warn(`Watchdog: WATCHDOG_MAX_RUNTIME_MINUTES is set to ${CONFIG.hardCeilingMinutes}, ` +
+      `below the ${formatDuration(appMaxRuntimeMinutes)} max runtime set on the dashboard ` +
+      `(plus ${formatDuration(grace)} of grace = ${formatDuration(wanted)}). Ignoring it and ` +
+      `honoring the dashboard - a stale value in /etc/default/water-monitor must not silently ` +
+      `cut fills short. Remove or raise that line to clear this warning.`);
+  }
+
+  // Bounded by the app's own validated ceiling rather than by whatever the env
+  // happens to say, so a corrupt status payload still cannot run forever.
+  return Math.min(ABSOLUTE_MAX_RUNTIME_MINUTES + grace, wanted);
 }
 
 // The status payload is untrusted input: it arrives over HTTP and is the output
@@ -121,6 +162,7 @@ function adoptAppRuntimeLimit(status) {
 
   const previous = appMaxRuntimeMinutes;
   appMaxRuntimeMinutes = reported;
+  staleCeilingWarned = false;
   console.log(`Watchdog: adopting max runtime of ${formatDuration(reported)} from the app ` +
     `(was ${previous === null ? `the ${formatDuration(CONFIG.fallbackRuntimeMinutes)} startup fallback` : formatDuration(previous)}). ` +
     `Will force the relay off after ${formatDuration(runtimeLimitMinutes())} of continuous observed runtime.`);
@@ -503,9 +545,11 @@ function onUnreachable(detail) {
 
 console.log(`Pump watchdog started. Polling ${CONFIG.statusUrl} every ${CONFIG.intervalSeconds}s. ` +
   `Forces pump off after ${CONFIG.failureThreshold} consecutive failed checks, or after the max runtime ` +
-  `set on the dashboard plus ${formatDuration(CONFIG.runtimeGraceMinutes)} of grace (hard cap ` +
-  `${formatDuration(CONFIG.hardCeilingMinutes)}), whichever comes first. Using a ` +
-  `${formatDuration(CONFIG.fallbackRuntimeMinutes)} fallback limit until the app first reports its setting. ` +
+  `set on the dashboard plus ${formatDuration(CONFIG.runtimeGraceMinutes)} of grace, whichever comes ` +
+  `first. Until the app first reports its setting, the limit is ` +
+  `${formatDuration(Math.min(CONFIG.hardCeilingMinutes, CONFIG.fallbackRuntimeMinutes + CONFIG.runtimeGraceMinutes))} ` +
+  `(WATCHDOG_MAX_RUNTIME_MINUTES=${CONFIG.hardCeilingMinutes} bounds that fallback only; it cannot cut ` +
+  `the dashboard's setting short). ` +
   `Allowing ${CONFIG.startupGraceSeconds}s for the main app to come up before the first check counts.`);
 
 checkStatus();

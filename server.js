@@ -255,6 +255,12 @@ let serialState = {
   connected: false,
   mode: CONFIG.simulate ? "simulation" : "serial",
   port: CONFIG.serialPort,
+  // How the port above was chosen: "identity" (matched the receiver's USB
+  // vendor/product ID), "configured" (fell back to SERIAL_PORT), or null.
+  // Shown in the UI because "which USB device am I actually reading?" is the
+  // single most confusing thing about this box.
+  resolvedBy: null,
+  lastLineAt: null,
   lastError: CONFIG.simulate ? null : "Serial reader has not opened yet."
 };
 
@@ -880,8 +886,24 @@ function initPumpOutput() {
   }
 }
 
+// The path the LoRa receiver is actually holding open right now, or null.
+// Deliberately not "the path we last tried": a port we failed to open is not
+// ours, and treating it as ours would let a missing receiver keep the relay
+// from claiming a path it is entitled to.
+function sensorHeldPath() {
+  return serialState.connected ? serialState.port : null;
+}
+
 async function resolveUsbRelayPath(settings) {
   if (!settings.usbRelayVendorId || !settings.usbRelayProductId) {
+    // A bare path with no identity behind it is the easiest way to end up
+    // driving relay commands into the LoRa receiver, so the one path we know
+    // belongs to the receiver is refused outright.
+    if (settings.usbRelayPort && settings.usbRelayPort === sensorHeldPath()) {
+      console.warn(`Pump relay is configured as ${settings.usbRelayPort}, which is the port the ` +
+        `LoRa receiver is currently open on. Refusing to send relay commands to the radio.`);
+      return null;
+    }
     return settings.usbRelayPort || null;
   }
 
@@ -902,11 +924,17 @@ async function resolveUsbRelayPath(settings) {
     const ports = await SerialPort.list();
     const match = ports.find((candidate) =>
       (candidate.vendorId || "").toLowerCase() === settings.usbRelayVendorId.toLowerCase() &&
-      (candidate.productId || "").toLowerCase() === settings.usbRelayProductId.toLowerCase());
+      (candidate.productId || "").toLowerCase() === settings.usbRelayProductId.toLowerCase() &&
+      // Never the port the receiver is reading. If a clone board leaves the
+      // two sharing a USB bridge chip, VID/PID alone cannot tell them apart,
+      // and the tiebreaker has to be "the radio already has this one."
+      candidate.path !== sensorHeldPath());
     return match ? match.path : null;
   } catch (error) {
     console.warn(`USB relay discovery by vendor/product ID failed: ${error.message}`);
-    return settings.usbRelayPort || null;
+    return settings.usbRelayPort && settings.usbRelayPort !== sensorHeldPath()
+      ? settings.usbRelayPort
+      : null;
   }
 }
 
@@ -1689,10 +1717,112 @@ function parseSerialLine(line) {
 
   try {
     saveReading(JSON.parse(trimmed));
+    serialState.lastLineAt = new Date().toISOString();
   } catch (error) {
     serialState.lastError = `Dropped serial line: ${error.message}`;
     console.warn(serialState.lastError, trimmed);
   }
+}
+
+// Paths that belong to the pump relay and must never be opened as the LoRa
+// receiver. Two sources, because either one alone has a hole: the relay's
+// configured USB identity covers the case where the relay is unplugged or has
+// been renumbered, and the relay driver's currently-open path covers a relay
+// that was found by a bare path with no identity configured.
+async function relayOwnedPaths(ports) {
+  const owned = new Set();
+  // Only a relay that is actually open counts as holding its path. A relay
+  // driver stuck retrying a path it cannot open does not own it, and treating
+  // it as owned would lock the receiver out of a port it is entitled to.
+  if (pumpOutput?.kind === "usb_relay" && pumpOutput.path && pumpState.output.available) {
+    owned.add(pumpOutput.path);
+  }
+
+  let settings;
+  try {
+    settings = getPumpOutputSettings();
+  } catch {
+    return owned;
+  }
+  if (settings.type !== "usb_relay") return owned;
+
+  if (settings.usbRelayVendorId && settings.usbRelayProductId) {
+    for (const candidate of ports) {
+      if (
+        (candidate.vendorId || "").toLowerCase() === settings.usbRelayVendorId.toLowerCase() &&
+        (candidate.productId || "").toLowerCase() === settings.usbRelayProductId.toLowerCase()
+      ) {
+        owned.add(candidate.path);
+      }
+    }
+  } else if (settings.usbRelayPort) {
+    owned.add(settings.usbRelayPort);
+  }
+
+  return owned;
+}
+
+// Work out which USB device is actually the LoRa receiver, right now.
+//
+// This used to be a bare `SERIAL_PORT` path captured once at startup, and that
+// is the bug that made a reboot land the reader on the pump relay: the
+// receiver and the relay are both USB-serial adapters on the same machine, the
+// kernel hands out ttyUSB numbers in enumeration order, and whichever device
+// wins the race at boot becomes ttyUSB0. When the relay won, the app opened
+// the relay, held it open, read no readings out of it, and the pump could not
+// be driven - the relay was busy being mistaken for the radio.
+//
+// So: match the receiver by its USB vendor/product ID (the Heltec V3's CP2102
+// bridge by default), never hand back a path that belongs to the relay, and
+// re-run this on every reconnect rather than retrying one path forever.
+async function resolveSensorPath() {
+  let ports = [];
+  try {
+    ports = await SerialPort.list();
+  } catch (error) {
+    console.warn(`Could not enumerate serial ports: ${error.message}`);
+    return { path: CONFIG.serialPort, resolvedBy: "configured", conflict: null };
+  }
+
+  const owned = await relayOwnedPaths(ports);
+
+  const matches = ports.filter((candidate) =>
+    (candidate.vendorId || "").toLowerCase() === CONFIG.serialVendorId.toLowerCase() &&
+    (candidate.productId || "").toLowerCase() === CONFIG.serialProductId.toLowerCase() &&
+    !owned.has(candidate.path));
+
+  if (matches.length > 0) {
+    // Boards that share a USB bridge chip with the relay (some Heltec V3
+    // clones ship a CH340 instead of a CP2102) can leave more than one
+    // candidate standing. Prefer a stable serial number so the choice at least
+    // stays the same across reboots, and say plainly that it was ambiguous.
+    const sorted = [...matches].sort((a, b) =>
+      (a.serialNumber ? 0 : 1) - (b.serialNumber ? 0 : 1) ||
+      String(a.serialNumber || "").localeCompare(String(b.serialNumber || "")) ||
+      String(a.path).localeCompare(String(b.path)));
+    return {
+      path: sorted[0].path,
+      resolvedBy: "identity",
+      conflict: matches.length > 1
+        ? `${matches.length} devices match the receiver's USB ID ${CONFIG.serialVendorId}:${CONFIG.serialProductId}; using ${sorted[0].path}.`
+        : null
+    };
+  }
+
+  // No identity match. The configured path is the fallback - unless it is the
+  // relay, in which case opening it is the exact failure this function exists
+  // to prevent. Report the receiver as missing instead: a missing receiver
+  // stops the pump on the stale-reading rule, which is the safe direction.
+  if (owned.has(CONFIG.serialPort)) {
+    return {
+      path: null,
+      resolvedBy: null,
+      conflict: `${CONFIG.serialPort} is the pump relay, not the LoRa receiver. ` +
+        `Refusing to read the relay as the radio. Check that the receiver is plugged in.`
+    };
+  }
+
+  return { path: CONFIG.serialPort, resolvedBy: "configured", conflict: null };
 }
 
 function startSerialReader() {
@@ -1701,45 +1831,79 @@ function startSerialReader() {
     return;
   }
 
-  const port = new SerialPort({
-    path: CONFIG.serialPort,
-    baudRate: CONFIG.baudRate,
-    autoOpen: false
-  });
+  let port = null;
+  // Each attempt gets its own generation so a discarded port's late "error" or
+  // "close" event cannot overwrite the state of the attempt that replaced it.
+  let generation = 0;
 
-  const reopen = () => {
-    if (port.isOpen) return;
+  const retry = () => setTimeout(() => { connect().catch(() => {}); }, 10000);
+
+  const connect = async () => {
+    if (port?.isOpen) return;
+    const mine = ++generation;
+    const isCurrent = () => mine === generation;
+
+    const { path: resolvedPath, resolvedBy, conflict } = await resolveSensorPath();
+    if (conflict) console.warn(`Serial: ${conflict}`);
+
+    if (!resolvedPath) {
+      serialState.connected = false;
+      serialState.port = null;
+      serialState.resolvedBy = null;
+      serialState.lastError = conflict || "No LoRa receiver found.";
+      retry();
+      return;
+    }
+
+    serialState.port = resolvedPath;
+    serialState.resolvedBy = resolvedBy;
+
+    // A fresh SerialPort per attempt, because the path itself can change
+    // between attempts - the old code bound one path for the life of the
+    // process and retried it forever after a renumber.
+    port = new SerialPort({ path: resolvedPath, baudRate: CONFIG.baudRate, autoOpen: false });
+
+    port.on("open", () => {
+      if (!isCurrent()) return;
+      serialState.connected = true;
+      serialState.lastError = null;
+      console.log(`Reading serial data from ${resolvedPath} at ${CONFIG.baudRate} baud ` +
+        `(matched by ${resolvedBy === "identity" ? `USB ID ${CONFIG.serialVendorId}:${CONFIG.serialProductId}` : "configured SERIAL_PORT"})`);
+    });
+
+    port.on("error", (error) => {
+      if (!isCurrent()) return;
+      serialState.connected = false;
+      serialState.lastError = error.message;
+      console.error(`Serial error on ${resolvedPath}: ${error.message}`);
+    });
+
+    port.on("close", () => {
+      if (!isCurrent()) return;
+      serialState.connected = false;
+      serialState.lastError = "Serial port closed.";
+      console.warn(`Serial port ${resolvedPath} closed; re-resolving and retrying in 10 seconds.`);
+      retry();
+    });
+
+    port.pipe(new ReadlineParser({ delimiter: "\n" })).on("data", (line) => {
+      if (!isCurrent()) return;
+      parseSerialLine(line);
+    });
+
     port.open((error) => {
-      if (error) {
-        serialState.connected = false;
-        serialState.lastError = error.message;
-        console.warn(`Serial unavailable at ${CONFIG.serialPort}: ${error.message}`);
-        setTimeout(reopen, 10000);
-      }
+      if (!error || !isCurrent()) return;
+      serialState.connected = false;
+      serialState.lastError = error.message;
+      console.warn(`Serial unavailable at ${resolvedPath}: ${error.message}`);
+      retry();
     });
   };
 
-  port.on("open", () => {
-    serialState.connected = true;
-    serialState.lastError = null;
-    console.log(`Reading serial data from ${CONFIG.serialPort} at ${CONFIG.baudRate} baud`);
+  connect().catch((error) => {
+    console.error(`Serial reader failed to start: ${error.message}`);
+    retry();
   });
-
-  port.on("error", (error) => {
-    serialState.connected = false;
-    serialState.lastError = error.message;
-    console.error(`Serial error: ${error.message}`);
-  });
-
-  port.on("close", () => {
-    serialState.connected = false;
-    serialState.lastError = "Serial port closed.";
-    console.warn("Serial port closed; retrying in 10 seconds.");
-    setTimeout(reopen, 10000);
-  });
-
-  port.pipe(new ReadlineParser({ delimiter: "\n" })).on("data", parseSerialLine);
-  reopen();
 }
 
 function startSimulator() {
@@ -1794,19 +1958,54 @@ app.get("/api/latest", (req, res) => {
 app.get("/api/system/serial-ports", async (req, res) => {
   try {
     const ports = await SerialPort.list();
+    const relaySettings = getPumpOutputSettings();
+    const held = sensorHeldPath();
+
+    // Say what each USB device *is*, not just where it lives. A bare list of
+    // /dev paths is what made the receiver and the relay so easy to confuse in
+    // the first place - the paths move, the identities do not.
+    const roleOf = (port) => {
+      const vid = (port.vendorId || "").toLowerCase();
+      const pid = (port.productId || "").toLowerCase();
+      if (port.path === held) return "radio";
+      if (vid === CONFIG.serialVendorId.toLowerCase() && pid === CONFIG.serialProductId.toLowerCase()) return "radio";
+      if (
+        relaySettings.type === "usb_relay" &&
+        relaySettings.usbRelayVendorId && relaySettings.usbRelayProductId &&
+        vid === relaySettings.usbRelayVendorId.toLowerCase() &&
+        pid === relaySettings.usbRelayProductId.toLowerCase()
+      ) return "relay";
+      if (relaySettings.type === "usb_relay" && port.path === relaySettings.usbRelayPort) return "relay";
+      return "unknown";
+    };
+
     res.json({
       ports: ports.map((port) => ({
         path: port.path,
         manufacturer: port.manufacturer || null,
         serialNumber: port.serialNumber || null,
         vendorId: port.vendorId || null,
-        productId: port.productId || null
+        productId: port.productId || null,
+        role: roleOf(port),
+        inUseByRadio: port.path === held
       })),
+      // What the app believes the receiver is, so the Settings page can show
+      // "the radio is this device" instead of leaving it to be inferred.
+      radio: {
+        vendorId: CONFIG.serialVendorId,
+        productId: CONFIG.serialProductId,
+        connectedPath: held,
+        resolvedBy: serialState.resolvedBy,
+        lastError: serialState.lastError
+      },
       // So the relay port picker can avoid defaulting to (or silently
       // accepting a "lock to this device" on) the water-level sensor's own
       // port - the sensor and the relay are both USB-serial devices on the
       // same machine and are easy to mix up from a bare port list.
-      sensorPort: CONFIG.serialPort
+      // The path the receiver is on *now* when it is connected, not just the
+      // configured fallback - the whole point of identity matching is that the
+      // configured path is often not where the receiver actually ended up.
+      sensorPort: held || CONFIG.serialPort
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
